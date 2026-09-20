@@ -10,6 +10,7 @@ import (
 	"slices"
 	"sort"
 	"sync"
+	"time"
 
 	"github.com/Viking602/venat/agent"
 	"github.com/Viking602/venat/message"
@@ -25,8 +26,13 @@ type DriveOptions struct {
 	MaxTicks             int
 	MaxConcurrency       int
 	UnlimitedConcurrency bool
-	Sink                 agent.Sink
-	InitialState         *State
+	// MaxWallClock bounds the complete Drive invocation, including scheduler
+	// waits and all ticks. Zero leaves the caller context as the outer bound.
+	MaxWallClock time.Duration
+	// DispatchTimeout bounds one Executor call. Zero inherits the Drive context.
+	DispatchTimeout time.Duration
+	Sink            agent.Sink
+	InitialState    *State
 }
 
 // Drive repeatedly schedules and executes deterministic ticks until Scheduler
@@ -38,9 +44,11 @@ func Drive(ctx context.Context, scheduler Scheduler, executor Executor, options 
 	if nilInterface(executor) {
 		return State{}, fmt.Errorf("%w: nil executor", ErrInvalidArgument)
 	}
-	if options.MaxTicks < 0 || options.MaxConcurrency < 0 {
+	if options.MaxTicks < 0 || options.MaxConcurrency < 0 || options.MaxWallClock < 0 || options.DispatchTimeout < 0 {
 		return State{}, fmt.Errorf("%w: negative drive limit", ErrInvalidArgument)
 	}
+	driveCtx, cancel := driveContext(ctx, options.MaxWallClock)
+	defer cancel()
 	maxTicks := options.MaxTicks
 	if maxTicks == 0 {
 		maxTicks = defaultMaxTicks
@@ -59,16 +67,12 @@ func Drive(ctx context.Context, scheduler Scheduler, executor Executor, options 
 	}
 	completedTicks := 0
 	for {
-		if err := ctx.Err(); err != nil {
+		if err := driveCtx.Err(); err != nil {
+			return state, contextLimitError(driveCtx, err)
+		}
+		dispatches, err := nextDispatches(driveCtx, scheduler, state)
+		if err != nil {
 			return state, err
-		}
-		dispatches, err := callScheduler(ctx, scheduler, cloneState(state))
-		if err != nil {
-			return state, &SchedulerError{Tick: state.Tick, Err: err}
-		}
-		dispatches, err = validateBatch(state, dispatches)
-		if err != nil {
-			return state, &SchedulerError{Tick: state.Tick, Err: err}
 		}
 		if len(dispatches) == 0 {
 			return state, nil
@@ -77,7 +81,7 @@ func Drive(ctx context.Context, scheduler Scheduler, executor Executor, options 
 			return state, ErrMaxTicks
 		}
 
-		next, runErr := executeBatch(ctx, state, dispatches, executor, options.Sink, maxConcurrency, options.UnlimitedConcurrency)
+		next, runErr := executeBatch(driveCtx, state, dispatches, executor, options.Sink, maxConcurrency, options.UnlimitedConcurrency, options.DispatchTimeout)
 		state = next
 		if runErr != nil {
 			return state, runErr
@@ -85,6 +89,25 @@ func Drive(ctx context.Context, scheduler Scheduler, executor Executor, options 
 		state.Tick++
 		completedTicks++
 	}
+}
+
+func nextDispatches(ctx context.Context, scheduler Scheduler, state State) ([]Dispatch, error) {
+	dispatches, err := callScheduler(ctx, scheduler, cloneState(state))
+	if err != nil {
+		schedulerErr := &SchedulerError{Tick: state.Tick, Err: err}
+		if ctx.Err() != nil {
+			return nil, errors.Join(schedulerErr, contextLimitError(ctx, ctx.Err()))
+		}
+		return nil, schedulerErr
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, contextLimitError(ctx, err)
+	}
+	dispatches, err = validateBatch(state, dispatches)
+	if err != nil {
+		return nil, &SchedulerError{Tick: state.Tick, Err: err}
+	}
+	return dispatches, nil
 }
 
 func callScheduler(ctx context.Context, scheduler Scheduler, state State) (dispatches []Dispatch, err error) {
@@ -153,6 +176,7 @@ func executeBatch(
 	sink agent.Sink,
 	maxConcurrency int,
 	unlimited bool,
+	dispatchTimeout time.Duration,
 ) (State, error) {
 	batchCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -191,7 +215,14 @@ launchLoop:
 			if sink != nil {
 				dispatchSink = sourceSink{source: dispatch.ID, next: sharedSink}
 			}
-			result, err := callExecutor(batchCtx, executor, cloneDispatch(dispatch), dispatchSink)
+			callCtx, cancelCall := dispatchContext(batchCtx, dispatchTimeout)
+			result, err := callExecutor(callCtx, executor, cloneDispatch(dispatch), dispatchSink)
+			if err != nil {
+				err = contextLimitError(callCtx, err)
+			} else if errors.Is(context.Cause(callCtx), ErrDispatchTimeout) || errors.Is(context.Cause(callCtx), ErrMaxWallClock) {
+				err = contextLimitError(callCtx, nil)
+			}
+			cancelCall()
 			records <- dispatchExecution{dispatch: dispatch, result: cloneResult(result), err: err}
 			if err != nil {
 				cancel()
@@ -236,9 +267,37 @@ launchLoop:
 		joined = append(joined, failure)
 	}
 	if ctxErr := ctx.Err(); ctxErr != nil {
-		joined = append(joined, ctxErr)
+		joined = append(joined, contextLimitError(ctx, ctxErr))
 	}
 	return next, errors.Join(joined...)
+}
+
+func driveContext(ctx context.Context, maxWallClock time.Duration) (context.Context, context.CancelFunc) {
+	if maxWallClock <= 0 {
+		return ctx, func() {}
+	}
+	return context.WithTimeoutCause(ctx, maxWallClock, ErrMaxWallClock)
+}
+
+func dispatchContext(ctx context.Context, timeout time.Duration) (context.Context, context.CancelFunc) {
+	if timeout <= 0 {
+		return ctx, func() {}
+	}
+	return context.WithTimeoutCause(ctx, timeout, ErrDispatchTimeout)
+}
+
+func contextLimitError(ctx context.Context, err error) error {
+	if err == nil {
+		if ctx.Err() == nil {
+			return nil
+		}
+		err = ctx.Err()
+	}
+	cause := context.Cause(ctx)
+	if cause == nil || errors.Is(err, cause) {
+		return err
+	}
+	return errors.Join(err, cause)
 }
 
 func callExecutor(ctx context.Context, executor Executor, dispatch Dispatch, sink agent.Sink) (result agent.Result, err error) {
@@ -268,9 +327,18 @@ func cloneState(state State) State {
 }
 
 func cloneDispatch(dispatch Dispatch) Dispatch {
+	dispatch.Request.Content = message.CloneContent(dispatch.Request.Content)
 	if dispatch.Request.Budget != nil {
 		budget := *dispatch.Request.Budget
 		dispatch.Request.Budget = &budget
+	}
+	if dispatch.Request.SessionBudget != nil {
+		budget := *dispatch.Request.SessionBudget
+		dispatch.Request.SessionBudget = &budget
+	}
+	if dispatch.Request.ModelTimeouts != nil {
+		policy := *dispatch.Request.ModelTimeouts
+		dispatch.Request.ModelTimeouts = &policy
 	}
 	dispatch.OutputPolicy.Schema = append(json.RawMessage(nil), dispatch.OutputPolicy.Schema...)
 	if dispatch.Handoff != nil {

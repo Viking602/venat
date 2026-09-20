@@ -81,6 +81,34 @@ func TestMaxWallClockBudgetPrecedence(t *testing.T) {
 	}
 }
 
+func TestSessionBudgetBoundsEngineExecution(t *testing.T) {
+	driver := deadlineRecordingProvider{observed: make(chan time.Duration, 1)}
+	engine := Engine{Provider: driver}
+	request := Request{
+		Prompt:        "session deadline",
+		SessionBudget: &SessionBudget{MaxWallClock: 20 * time.Millisecond},
+	}
+
+	result := engine.Run(context.Background(), request, OutputPolicy{})
+	if result.Failure == nil || result.Failure.Kind != FailureKindBudgetExhausted {
+		t.Fatalf("Failure = %#v, want budget_exhausted", result.Failure)
+	}
+	if !errors.Is(result.Failure, context.DeadlineExceeded) {
+		t.Fatalf("failure cause = %v, want context deadline exceeded", result.Failure)
+	}
+	assertDurationNear(t, <-driver.observed, request.SessionBudget.MaxWallClock)
+}
+
+func TestSessionBudgetOverridesEngineDefault(t *testing.T) {
+	engine := Engine{LoopPolicy: LoopPolicy{SessionBudget: &SessionBudget{MaxWallClock: time.Second}}}
+	if got := engine.maxWallClock(Request{SessionBudget: &SessionBudget{MaxWallClock: 30 * time.Millisecond}}); got != 30*time.Millisecond {
+		t.Fatalf("maxWallClock = %s, want request session budget", got)
+	}
+	if got := engine.maxWallClock(Request{SessionBudget: &SessionBudget{}}); got != 0 {
+		t.Fatalf("maxWallClock = %s, want request zero session budget to disable default", got)
+	}
+}
+
 func TestEngineRunContextBuildHonorsMaxWallClock(t *testing.T) {
 	tests := []struct {
 		name          string

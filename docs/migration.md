@@ -4,6 +4,42 @@ ADR-029 is a breaking clean cutover. The former platform façade and platform-ow
 
 This document may name deleted APIs for migration purposes. Current API guidance lives in [Public API](public-api.md).
 
+## Execution-completeness changes
+
+- Opt into provider JSON Schema output with `OutputPolicy.Native`; existing local
+  validation/repair policies keep their default behavior. Invalid enabled schemas
+  now fail before effects, and repair checkpoints record a continue decision.
+- ProcessTool confirmed nonzero exits are completed error results with logs and
+  exit status. Code that expected every nonzero exit to abort must inspect
+  `Result.IsError` or supply its own wrapper. Confirmed signals with an active
+  context and ordinary missing/permission-denied launch failures are feedback;
+  cancellation and infrastructure errors remain errors. Oversized logs are
+  truncated and drained, with a notice, instead of killing the process.
+- `kit.Tool` preserves explicit `tool.Result` outputs and recognizes a confirmed
+  `exec.ExitError` (including single-chain wrapping) as feedback. Joined errors
+  and uncertain failures remain fatal. Go argument conversion errors are feedback
+  before the function runs.
+- `Bus.Execute` returns an error result for unknown names instead of
+  `ErrToolNotFound`; inspect `Result.IsError`. Unknown names and other rejected
+  calls count toward the Agent call budget. No unregistered driver is executed.
+- Terminal tools end an execution only on successful results. A failed terminal
+  call now returns control to the model; explicit step policies and budgets still
+  apply. See [error boundaries](agent-execution.md#recoverable-feedback-and-fatal-boundaries).
+- A positive context target with built-in builders now fits the provider view;
+  irreducible or media context needs an explicit model-aware compactor. The full
+  transcript remains available for results and recovery.
+- `Request.Content` adds typed user media; old Request composites using positional
+  fields should be changed to named fields. Mutable media is cloned at boundaries.
+- Use one fresh Control per execution. Queued input and persistent acknowledgement
+  have different guarantees; see [Agent execution](agent-execution.md).
+- New checkpoints use v2; legacy v1 hashes stay readable. Follow the coordinated
+  reader/writer and rollback procedure in [Durable execution](durable-execution.md#wire-version-and-rollout).
+- `Request.SessionBudget` can carry cumulative token and active wall-clock limits
+  through continuation and durable resume. `Request.ModelTimeouts` adds Codex-style
+  connection and stream-idle defaults; set `DisableDefaults` when an application
+  needs only explicit deadlines. `orchestration.DriveOptions` accepts whole-drive
+  and per-dispatch wall-clock limits.
+
 ## Package migration map
 
 | Removed surface | Current composition |
@@ -131,3 +167,23 @@ Version `1` is the first supported continuation wire format. Before enabling a v
 3. Streaming is transient and not an exactly-once event log.
 4. Durable execution covers provider and tool effects only. Hook, observer, guardrail, context-manager, and sink side effects need their own idempotency.
 5. Durable state covers one Agent execution. Application orchestration state remains separate.
+
+## Bounded response recovery and explicit Jev capability
+
+- Completed invalid tool JSON, empty final output and output-length cutoff now
+  request correction (at most three retries, within existing budgets). Invalid
+  response batches execute no tools. Repeated incompleteness is `repair_failed`.
+  Missing/conflicting call IDs and broken/interrupted streams remain fatal.
+- Confirmed `ProcessTool` local deadlines become error results on Darwin/Linux;
+  parent deadlines, cancellation and unknown effects keep their prior semantics.
+  Oversized logs retain head and tail; HTTP oversize becomes bounded error feedback
+  with its status and no Structured payload. Neither behavior proves no effects ran.
+- `ContextBuilderFunc` now participates in default fitting when a target is set.
+  Canonical contents replace duplicate legacy mirrors in estimates. Oversized plain
+  tool output may be shortened only in the model view; transcript bytes remain.
+- Jev is disabled by default. Explicit `BuildDeps.ContextSelection` plus a named
+  `select_context` tool exposes advisory Noul scores, not automatic compaction.
+  Set protocol, BaseURL, APIKey and Model; no environment/default endpoint is used.
+- Malformed full-call model attempts write envelope v2. Upgrade shared workers
+  before use; older readers reject this envelope. Ordinary attempts and existing
+  continuation canonical encodings are unchanged. See the durable rollout notes.

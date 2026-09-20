@@ -7,6 +7,7 @@ toolchain go1.25.13
 retract v0.10.0 // Published from a reused tag; its public checksum cannot verify.
 
 require (
+	github.com/Viking602/llmux v0.4.0
 	github.com/santhosh-tekuri/jsonschema/v6 v6.0.3
 	gopkg.in/yaml.v3 v3.0.1
 )

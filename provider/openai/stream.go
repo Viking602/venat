@@ -319,7 +319,7 @@ func marshalChatCompletionRequest(payload chatCompletionRequest, extraBody map[s
 }
 
 func marshalChatCompletionRequestBody(body []byte, extraFields map[string]any) ([]byte, error) {
-	merged := map[string]any{}
+	merged := map[string]json.RawMessage{}
 	if err := json.Unmarshal(body, &merged); err != nil {
 		return nil, err
 	}
@@ -329,7 +329,11 @@ func marshalChatCompletionRequestBody(body []byte, extraFields map[string]any) (
 				continue
 			}
 		}
-		merged[key] = value
+		encoded, err := json.Marshal(value)
+		if err != nil {
+			return nil, fmt.Errorf("marshal openai chat extra body field %q: %w", key, err)
+		}
+		merged[key] = encoded
 	}
 	return json.Marshal(merged)
 }
@@ -378,7 +382,9 @@ func responseFormatFromRequest(format *provider.ResponseFormat) any {
 				"strict": format.Strict,
 			},
 		}
-		if format.Schema != nil {
+		if len(format.RawSchema) > 0 {
+			payload["json_schema"].(map[string]any)["schema"] = format.RawSchema
+		} else if format.Schema != nil {
 			payload["json_schema"].(map[string]any)["schema"] = format.Schema
 		}
 		return payload

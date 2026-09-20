@@ -655,7 +655,7 @@ func TestRuntime_DurableInterceptorsAreOutermostAndBoundaryIsLast(t *testing.T) 
 	runtime := newTestRuntime(t, recordingBackend{Backend: store, recorder: recorder}, Options{OwnerID: "ordering"})
 	driver := &runtimeProvider{responses: []func(context.Context, provider.Request) (provider.Stream, error){func(context.Context, provider.Request) (provider.Stream, error) {
 		recorder.add("provider")
-		return provider.NewSliceStream([]provider.Event{{Kind: provider.EventDone, StopReason: provider.StopReasonComplete}}), nil
+		return provider.NewSliceStream([]provider.Event{{Kind: provider.EventTextDelta, Text: "done"}, {Kind: provider.EventDone, StopReason: provider.StopReasonComplete}}), nil
 	}}}
 	engine := testEngine(driver)
 	engine.ModelInterceptor = provider.StreamInterceptorFunc(func(ctx context.Context, next provider.Driver, request provider.Request) (provider.Stream, error) {
@@ -877,11 +877,16 @@ func (backend *heartbeatBackend) RenewExecution(ctx context.Context, request Ren
 }
 
 type delayedStream struct {
-	delay time.Duration
-	done  bool
+	delay    time.Duration
+	done     bool
+	textSent bool
 }
 
 func (stream *delayedStream) Recv() (provider.Event, error) {
+	if !stream.textSent {
+		stream.textSent = true
+		return provider.Event{Kind: provider.EventTextDelta, Text: "done"}, nil
+	}
 	if stream.done {
 		return provider.Event{}, io.EOF
 	}

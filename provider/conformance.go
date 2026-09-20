@@ -240,6 +240,10 @@ func applyToolCallDeltaEvent(delta *ToolCallDelta, builders map[string]*toolCall
 // finalizeToolCalls walks the accumulated builders in arrival order, validates
 // the JSON arguments, and appends them to response.ToolCalls.
 func finalizeToolCalls(response NormalizedResponse, order []string, builders map[string]*toolCallBuilder) (NormalizedResponse, error) {
+	if len(order) > MaxToolCallsPerResponse {
+		return NormalizedResponse{}, fmt.Errorf("%w: more than %d", ErrTooManyProviderToolCalls, MaxToolCallsPerResponse)
+	}
+	var argumentsErr error
 	for _, key := range order {
 		builder := builders[key]
 		if builder == nil {
@@ -253,7 +257,10 @@ func finalizeToolCalls(response NormalizedResponse, order []string, builders map
 		}
 		arguments := builder.Arguments.String()
 		if arguments != "" && !json.Valid([]byte(arguments)) {
-			return NormalizedResponse{}, fmt.Errorf("%w: %s", ErrInvalidToolCallArguments, toolCallBuilderLabel(key, builder))
+			// Validate every identity before returning a recoverable argument error.
+			// Raw malformed JSON must never enter messages or checkpoint payloads.
+			argumentsErr = errors.Join(argumentsErr, fmt.Errorf("%w: %s", ErrInvalidToolCallArguments, toolCallBuilderLabel(key, builder)))
+			continue
 		}
 		if len(response.ToolCalls) >= MaxToolCallsPerResponse {
 			return NormalizedResponse{}, fmt.Errorf(
@@ -268,7 +275,10 @@ func finalizeToolCalls(response NormalizedResponse, order []string, builders map
 			Arguments: []byte(arguments),
 		})
 	}
-	return response, nil
+	if argumentsErr != nil {
+		response.ToolCalls = nil // no sibling calls execute from this rejected turn
+	}
+	return response, argumentsErr
 }
 
 type toolCallBuilder struct {

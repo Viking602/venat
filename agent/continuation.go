@@ -17,8 +17,9 @@ import (
 // without guessing or repairing history.
 var ErrInvalidContinuation = errors.New("invalid agent continuation")
 
-// ContinuationSchemaVersion is the only supported continuation wire version.
-const ContinuationSchemaVersion = 1
+// ContinuationSchemaVersion is the current wire version. Version 1 remains
+// readable and re-encodable without changing its canonical hash.
+const ContinuationSchemaVersion = 2
 
 // ContinuationPhase identifies the next deterministic Engine action.
 type ContinuationPhase string
@@ -91,10 +92,10 @@ func cloneContinuation(continuation Continuation) Continuation {
 }
 
 func cloneRequest(request Request) Request {
-	if request.Budget != nil {
-		budget := *request.Budget
-		request.Budget = &budget
-	}
+	request.Content = message.CloneContent(request.Content)
+	request.Budget = cloneBudget(request.Budget)
+	request.SessionBudget = cloneSessionBudget(request.SessionBudget)
+	request.ModelTimeouts = cloneModelTimeouts(request.ModelTimeouts)
 	return request
 }
 
@@ -121,8 +122,14 @@ func cloneSteps(steps []Step) []Step {
 
 // ValidateContinuation rejects corrupt or internally inconsistent resume state.
 func ValidateContinuation(continuation Continuation) error {
-	if continuation.SchemaVersion != ContinuationSchemaVersion {
+	if continuation.SchemaVersion != 1 && continuation.SchemaVersion != ContinuationSchemaVersion {
 		return continuationError("unsupported schema version %d", continuation.SchemaVersion)
+	}
+	if continuation.SchemaVersion == 1 && (len(continuation.Request.Content) > 0 || continuation.OutputPolicy.Native) {
+		return continuationError("request content and native output require schema version 2")
+	}
+	if err := continuation.Request.Validate(); err != nil {
+		return continuationError("invalid request content: %v", err)
 	}
 	if err := validateContinuationScalars(continuation); err != nil {
 		return err
@@ -378,6 +385,12 @@ func validateContinuationScalars(continuation Continuation) error {
 	}
 	if err := validateContinuationBudget(continuation.Request.Budget); err != nil {
 		return err
+	}
+	if err := validateSessionBudget(continuation.Request.SessionBudget); err != nil {
+		return continuationError("%v", err)
+	}
+	if err := validateModelTimeouts(continuation.Request.ModelTimeouts); err != nil {
+		return continuationError("%v", err)
 	}
 	if err := validateContinuationOutputPolicy(continuation.OutputPolicy); err != nil {
 		return err

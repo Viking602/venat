@@ -32,9 +32,18 @@ func cloneExecutionSpec(spec ExecutionSpec) ExecutionSpec {
 }
 
 func cloneRequest(request agent.Request) agent.Request {
+	request.Content = message.CloneContent(request.Content)
 	if request.Budget != nil {
 		budget := *request.Budget
 		request.Budget = &budget
+	}
+	if request.SessionBudget != nil {
+		budget := *request.SessionBudget
+		request.SessionBudget = &budget
+	}
+	if request.ModelTimeouts != nil {
+		policy := *request.ModelTimeouts
+		request.ModelTimeouts = &policy
 	}
 	return request
 }

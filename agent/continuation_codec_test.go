@@ -6,6 +6,7 @@ import (
 	"errors"
 	"reflect"
 	"testing"
+	"time"
 
 	"github.com/Viking602/venat/message"
 )
@@ -74,6 +75,29 @@ func TestContinuationCodec_CanonicalRoundTrip(t *testing.T) {
 	}
 }
 
+func TestContinuationCodec_PreservesExecutionEnvelope(t *testing.T) {
+	continuation := codecReadyContinuation()
+	continuation.Request.SessionBudget = &SessionBudget{MaxTokens: 1000, MaxWallClock: time.Minute}
+	continuation.Request.ModelTimeouts = &ModelTimeoutPolicy{
+		ConnectTimeout:    time.Second,
+		RequestTimeout:    2 * time.Second,
+		StreamIdleTimeout: 3 * time.Second,
+		DisableDefaults:   true,
+	}
+
+	encoded, err := EncodeContinuation(continuation)
+	if err != nil {
+		t.Fatalf("EncodeContinuation() error = %v", err)
+	}
+	decoded, err := DecodeContinuation(encoded)
+	if err != nil {
+		t.Fatalf("DecodeContinuation() error = %v", err)
+	}
+	if !reflect.DeepEqual(decoded.Request.SessionBudget, continuation.Request.SessionBudget) || !reflect.DeepEqual(decoded.Request.ModelTimeouts, continuation.Request.ModelTimeouts) {
+		t.Fatalf("execution envelope = %#v/%#v, want %#v/%#v", decoded.Request.SessionBudget, decoded.Request.ModelTimeouts, continuation.Request.SessionBudget, continuation.Request.ModelTimeouts)
+	}
+}
+
 func TestContinuationCodec_RejectsOpenOrAmbiguousDocuments(t *testing.T) {
 	valid, err := EncodeContinuation(codecReadyContinuation())
 	if err != nil {
@@ -103,7 +127,7 @@ func TestContinuationCodec_RejectsOpenOrAmbiguousDocuments(t *testing.T) {
 			fields["schemaVersion"] = json.RawMessage(`0`)
 		}),
 		"future schema version": mutateContinuationJSON(t, valid, func(fields map[string]json.RawMessage) {
-			fields["schemaVersion"] = json.RawMessage(`2`)
+			fields["schemaVersion"] = json.RawMessage(`3`)
 		}),
 		"string schema version": mutateContinuationJSON(t, valid, func(fields map[string]json.RawMessage) {
 			fields["schemaVersion"] = json.RawMessage(`"1"`)

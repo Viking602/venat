@@ -24,8 +24,6 @@ const (
 	defaultMaxProcessOutputBytes = 1 << 20
 )
 
-var errProcessOutputTooLarge = errors.New("process output too large")
-
 type HTTPToolConfig struct {
 	Method  string
 	URL     string
@@ -56,7 +54,7 @@ func HTTPTool(name string, schema tool.Schema, cfg HTTPToolConfig, options ...To
 			}
 			request, err := http.NewRequestWithContext(ctx, method, cfg.URL, bytes.NewReader(call.Arguments))
 			if err != nil {
-				return tool.Result{}, err
+				return tool.Result{}, errors.Join(tool.ErrNotExecuted, err)
 			}
 			request.Header.Set("Content-Type", "application/json")
 			for key, value := range cfg.Headers {
@@ -67,11 +65,19 @@ func HTTPTool(name string, schema tool.Schema, cfg HTTPToolConfig, options ...To
 				return tool.Result{}, err
 			}
 			defer func() { _ = response.Body.Close() }()
-			body, err := readLimited(response.Body, defaultMaxResponseBytes)
+			body, truncated, err := readLimited(response.Body, defaultMaxResponseBytes)
 			if err != nil {
 				return tool.Result{}, err
 			}
-			return resultFromPayload(call, body, response.StatusCode >= 400), nil
+			result := resultFromPayload(call, body, response.StatusCode >= 400 || truncated)
+			if truncated {
+				result.Structured = nil
+				result.Content += "\n[Response body truncated; request was sent. Use a smaller response or pagination; do not assume the operation was not executed.]"
+			}
+			if result.IsError {
+				result.Content += fmt.Sprintf("\nHTTP %d %s.", response.StatusCode, http.StatusText(response.StatusCode))
+			}
+			return result, nil
 		},
 	}
 	return driver
@@ -88,6 +94,9 @@ type ProcessToolConfig struct {
 	StdinJSON bool
 }
 
+// ProcessTool streams bounded output and drains excess logs until the process
+// exits. Confirmed unsuccessful exits and ordinary launch rejections produce
+// IsError feedback. Cancellation, I/O, and sink failures remain Go errors.
 func ProcessTool(name string, schema tool.Schema, cfg ProcessToolConfig, options ...ToolOption) tool.Driver {
 	config := toolConfig{}
 	for _, option := range options {
@@ -96,11 +105,11 @@ func ProcessTool(name string, schema tool.Schema, cfg ProcessToolConfig, options
 	return staticDriver{
 		definition: definitionFromConfig(name, schema, config),
 		execute: func(ctx context.Context, call tool.Call, sink tool.UpdateSink) (tool.Result, error) {
-			output, err := runProcess(ctx, cfg, call.Arguments, sink)
+			output, failed, err := runProcess(ctx, cfg, call.Arguments, sink)
 			if err != nil {
 				return tool.Result{}, err
 			}
-			return resultFromPayload(call, output, false), nil
+			return resultFromPayload(call, output, failed), nil
 		},
 	}
 }
@@ -115,25 +124,29 @@ func minimalProcessEnv() []string {
 	return out
 }
 
-func readLimited(reader io.Reader, maxBytes int64) ([]byte, error) {
+func readLimited(reader io.Reader, maxBytes int64) ([]byte, bool, error) {
 	body, err := io.ReadAll(io.LimitReader(reader, maxBytes+1))
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	if int64(len(body)) > maxBytes {
-		return nil, fmt.Errorf("http response body too large: limit %d bytes", maxBytes)
+		return body[:maxBytes], true, nil
 	}
-	return body, nil
+	return body, false, nil
 }
 
-func runProcess(ctx context.Context, cfg ProcessToolConfig, input []byte, sink tool.UpdateSink) ([]byte, error) {
-	commandCtx, cancel := context.WithCancel(ctx)
-	if _, hasDeadline := ctx.Deadline(); !hasDeadline {
-		commandCtx, cancel = context.WithTimeout(ctx, defaultProcessTimeout)
+func runProcess(ctx context.Context, cfg ProcessToolConfig, input []byte, sink tool.UpdateSink) ([]byte, bool, error) {
+	var commandCtx context.Context
+	var cancel context.CancelFunc
+	if _, hasDeadline := ctx.Deadline(); hasDeadline {
+		commandCtx, cancel = context.WithCancel(ctx)
+	} else {
+		commandCtx, cancel = context.WithTimeoutCause(ctx, defaultProcessTimeout, tool.ErrToolTimeout)
 	}
 	defer cancel()
 
 	command := exec.CommandContext(commandCtx, cfg.Command, cfg.Args...)
+	groupCancellation := configureProcessCancellation(command)
 	command.Dir = cfg.Dir
 	if len(cfg.Env) > 0 {
 		command.Env = append([]string{}, cfg.Env...)
@@ -146,21 +159,24 @@ func runProcess(ctx context.Context, cfg ProcessToolConfig, input []byte, sink t
 
 	stdoutRead, stdoutWrite, err := os.Pipe()
 	if err != nil {
-		return nil, err
+		return nil, false, errors.Join(tool.ErrNotExecuted, err)
 	}
 	stderrRead, stderrWrite, err := os.Pipe()
 	if err != nil {
-		return nil, errors.Join(err, closePipe(stdoutRead), closePipe(stdoutWrite))
+		return nil, false, errors.Join(tool.ErrNotExecuted, err, closePipe(stdoutRead), closePipe(stdoutWrite))
 	}
 	command.Stdout = stdoutWrite
 	command.Stderr = stderrWrite
 
 	if err := command.Start(); err != nil {
 		closeErr := errors.Join(closePipe(stdoutRead), closePipe(stdoutWrite), closePipe(stderrRead), closePipe(stderrWrite))
-		if ctxErr := ctx.Err(); ctxErr != nil {
-			return nil, errors.Join(ctxErr, closeErr)
+		if ctxErr := commandCtx.Err(); ctxErr != nil {
+			return nil, false, errors.Join(tool.ErrNotExecuted, ctxErr, closeErr)
 		}
-		return nil, errors.Join(err, closeErr)
+		if closeErr == nil && (errors.Is(err, exec.ErrNotFound) || errors.Is(err, os.ErrNotExist) || errors.Is(err, os.ErrPermission)) {
+			return []byte(fmt.Sprintf("Process did not start: %v", err)), true, nil
+		}
+		return nil, false, errors.Join(tool.ErrNotExecuted, err, closeErr)
 	}
 	// Close the parent write ends so Copy sees EOF when the child exits.
 	// Wait() must not own these pipes: StdoutPipe/StderrPipe close them under
@@ -169,7 +185,7 @@ func runProcess(ctx context.Context, cfg ProcessToolConfig, input []byte, sink t
 		cancel()
 		_ = stdoutRead.Close()
 		_ = stderrRead.Close()
-		return nil, errors.Join(err, command.Wait())
+		return nil, false, errors.Join(err, command.Wait())
 	}
 
 	output := &limitedOutputBuffer{max: defaultMaxProcessOutputBytes, sink: sink}
@@ -180,7 +196,7 @@ func runProcess(ctx context.Context, cfg ProcessToolConfig, input []byte, sink t
 			copyErr = nil
 		}
 		closeErr := closePipe(reader)
-		if errors.Is(copyErr, errProcessOutputTooLarge) {
+		if copyErr != nil || closeErr != nil {
 			cancel()
 		}
 		copyErrs <- errors.Join(copyErr, closeErr)
@@ -196,22 +212,61 @@ func runProcess(ctx context.Context, cfg ProcessToolConfig, input []byte, sink t
 		close(copyDone)
 	}()
 	waitErr := waitAndUnblockPipes(commandCtx, command, copyDone, stdoutRead, stderrRead)
-	if output.TooLarge() {
-		return output.Bytes(), fmt.Errorf("process output too large: limit %d bytes", defaultMaxProcessOutputBytes)
+	return finishProcessOutput(commandCtx, output, waitErr, errors.Join(stdoutErr, stderrErr), sink, groupCancellation)
+}
+
+// Finalize feedback only after Wait and both output readers have completed.
+func finishProcessOutput(ctx context.Context, output *limitedOutputBuffer, waitErr, copyErr error, sink tool.UpdateSink, managedGroup bool) ([]byte, bool, error) {
+	localTimeout := managedGroup && errors.Is(context.Cause(ctx), tool.ErrToolTimeout) && completedProcessExit(waitErr) != nil
+	contextErr := ctx.Err()
+	if localTimeout {
+		contextErr = nil
+	} // child reaped; partial side effects are still possible
+	if err := errors.Join(contextErr, copyErr); err != nil {
+		return output.Bytes(), false, err
 	}
-	if ctxErr := ctx.Err(); ctxErr != nil {
-		return output.Bytes(), ctxErr
+	if err := output.Flush(); err != nil {
+		return output.Bytes(), false, err
 	}
+	var suffix string
 	if waitErr != nil {
-		return output.Bytes(), waitErr
+		exited := completedProcessExit(waitErr)
+		if exited == nil {
+			return output.Bytes(), false, waitErr
+		}
+		suffix = "\n" + processExitDescription(exited)
 	}
-	if stdoutErr != nil {
-		return output.Bytes(), stdoutErr
+	if localTimeout {
+		suffix += "\n[Process exceeded its tool-local deadline and was terminated. Partial side effects may have occurred.]"
 	}
-	if stderrErr != nil {
-		return output.Bytes(), stderrErr
+	if output.TooLarge() {
+		suffix += fmt.Sprintf("\n[Output truncated at %d bytes.]", defaultMaxProcessOutputBytes)
 	}
-	return output.Bytes(), nil
+	if sink != nil && suffix != "" {
+		if err := sink(tool.Update{Kind: tool.UpdateOutput, Parts: []message.ContentPart{message.TextPart(suffix)}}); err != nil {
+			return output.Bytes(), false, err
+		}
+	}
+	return append(output.Bytes(), suffix...), waitErr != nil, nil
+}
+
+// Only a single error chain ending in an observed process exit qualifies.
+// Joined errors may also contain an infrastructure failure and stay fatal.
+func completedProcessExit(err error) *exec.ExitError {
+	for err != nil {
+		if exited, ok := err.(*exec.ExitError); ok && exited.ProcessState != nil {
+			return exited
+		}
+		err = errors.Unwrap(err)
+	}
+	return nil
+}
+
+func processExitDescription(exited *exec.ExitError) string {
+	if code := exited.ExitCode(); code >= 0 {
+		return fmt.Sprintf("Process exited with code %d.", code)
+	}
+	return "Process terminated: " + exited.Error() + "."
 }
 
 func waitAndUnblockPipes(ctx context.Context, command *exec.Cmd, copyDone <-chan struct{}, stdout, stderr *os.File) error {
@@ -266,6 +321,8 @@ type limitedOutputBuffer struct {
 	mu       sync.Mutex
 	buf      bytes.Buffer
 	max      int64
+	tail     []byte
+	total    int64
 	sink     tool.UpdateSink
 	tooLarge bool
 }
@@ -274,25 +331,42 @@ func (b *limitedOutputBuffer) Write(p []byte) (int, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
-	if int64(b.buf.Len()+len(p)) > b.max {
-		remaining := int(b.max) - b.buf.Len()
-		if remaining > 0 {
-			_, _ = b.buf.Write(p[:remaining])
-			if err := b.emit(p[:remaining]); err != nil {
-				return remaining, err
-			}
+	size := len(p)
+	b.total += int64(size)
+	b.tooLarge = b.total > b.max
+	headSize := int(b.max) / 2
+	take := min(len(p), max(0, headSize-b.buf.Len()))
+	if take > 0 {
+		_, _ = b.buf.Write(p[:take])
+		if err := b.emit(p[:take]); err != nil {
+			return take, err
 		}
-		b.tooLarge = true
-		return len(p), errProcessOutputTooLarge
 	}
-	written, err := b.buf.Write(p)
-	if err != nil {
-		return written, err
+	p = p[take:]
+	tailSize := int(b.max) - headSize
+	if len(p) >= tailSize {
+		b.tail = append(b.tail[:0], p[len(p)-tailSize:]...)
+	} else {
+		drop := max(0, len(b.tail)+len(p)-tailSize)
+		b.tail = append(b.tail[drop:], p...)
 	}
-	if err := b.emit(p[:written]); err != nil {
-		return written, err
+	return size, nil
+}
+
+// The stable head streams immediately; the rolling tail is emitted only after
+// completion so the final result exactly matches the accumulated stream.
+func (b *limitedOutputBuffer) Flush() error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.emit(b.pending())
+}
+
+func (b *limitedOutputBuffer) pending() []byte {
+	var result []byte
+	if b.tooLarge {
+		result = []byte("\n[... middle output omitted ...]\n")
 	}
-	return written, nil
+	return append(result, b.tail...)
 }
 
 func (b *limitedOutputBuffer) emit(chunk []byte) error {
@@ -308,7 +382,7 @@ func (b *limitedOutputBuffer) emit(chunk []byte) error {
 func (b *limitedOutputBuffer) Bytes() []byte {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	return append([]byte{}, b.buf.Bytes()...)
+	return append(append([]byte{}, b.buf.Bytes()...), b.pending()...)
 }
 
 func (b *limitedOutputBuffer) TooLarge() bool {

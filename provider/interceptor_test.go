@@ -75,7 +75,8 @@ func TestStreamInterceptorIsolatesMutableRequestMembers(t *testing.T) {
 			Metadata:      map[string]string{"scope": "caller"},
 			StopSequences: []string{"STOP"},
 			ResponseFormat: &ResponseFormat{
-				Type: "json_schema",
+				Type:      "json_schema",
+				RawSchema: []byte(`{"type":"object"}`),
 				Schema: &message.JSONSchema{
 					Type:                 "object",
 					Required:             []string{"answer"},
@@ -99,6 +100,7 @@ func TestStreamInterceptorIsolatesMutableRequestMembers(t *testing.T) {
 		current.Metadata["scope"] = "interceptor"
 		current.StopSequences[0] = "CHANGED"
 		current.ResponseFormat.Schema.Required[0] = "changed"
+		current.ResponseFormat.RawSchema[0] = '['
 		*current.ResponseFormat.Schema.AdditionalProperties = true
 		*current.ParallelToolCalls = false
 		current.ExtraBody["nested"].(map[string]any)["enabled"] = false

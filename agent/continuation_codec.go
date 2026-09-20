@@ -12,6 +12,8 @@ import (
 	"github.com/Viking602/venat/provider"
 )
 
+// Versions 1 and 2 share the closed outer field set. Version 1's nested request
+// and output-policy exclusions are validated before decoding this shared shape.
 type continuationWireV1 struct {
 	SchemaVersion     int               `json:"schemaVersion"`
 	Request           Request           `json:"request"`
@@ -40,7 +42,7 @@ var continuationV1Fields = []string{
 	"phase",
 }
 
-// EncodeContinuation validates continuation and returns its canonical v1 JSON
+// EncodeContinuation validates continuation and returns its canonical JSON
 // representation. Every top-level recovery field is emitted.
 func EncodeContinuation(continuation Continuation) ([]byte, error) {
 	if err := ValidateContinuation(continuation); err != nil {
@@ -48,11 +50,11 @@ func EncodeContinuation(continuation Continuation) ([]byte, error) {
 	}
 	encoded, err := json.Marshal(continuationWireV1(continuation))
 	if err != nil {
-		return nil, continuationError("encode schema v1: %v", err)
+		return nil, continuationError("encode continuation: %v", err)
 	}
 	canonical, err := canonicalizeContinuationDocument(encoded)
 	if err != nil {
-		return nil, continuationError("canonicalize schema v1: %v", err)
+		return nil, continuationError("canonicalize continuation: %v", err)
 	}
 	return canonical, nil
 }
@@ -82,8 +84,24 @@ func DecodeContinuation(data []byte) (Continuation, error) {
 	if err := json.Unmarshal(versionRaw, &version); err != nil {
 		return Continuation{}, continuationError("schemaVersion must be an integer: %v", err)
 	}
-	if version != ContinuationSchemaVersion {
+	if version != 1 && version != ContinuationSchemaVersion {
 		return Continuation{}, continuationError("unsupported schema version %d", version)
+	}
+	if version == 1 {
+		var requestFields map[string]json.RawMessage
+		if err := json.Unmarshal(fields["request"], &requestFields); err != nil {
+			return Continuation{}, continuationError("decode v1 request: %v", err)
+		}
+		if _, exists := requestFields["content"]; exists {
+			return Continuation{}, continuationError("request content requires schema version 2")
+		}
+		var policyFields map[string]json.RawMessage
+		if err := json.Unmarshal(fields["outputPolicy"], &policyFields); err != nil {
+			return Continuation{}, continuationError("decode v1 output policy: %v", err)
+		}
+		if _, exists := policyFields["native"]; exists {
+			return Continuation{}, continuationError("native output requires schema version 2")
+		}
 	}
 	return decodeContinuationV1(data, fields)
 }
@@ -130,7 +148,7 @@ func decodeContinuationV1(data []byte, fields map[string]json.RawMessage) (Conti
 
 	var wire continuationWireV1
 	if err := decodeContinuationJSON(data, &wire, true); err != nil {
-		return Continuation{}, continuationError("decode schema v1: %v", err)
+		return Continuation{}, continuationError("decode continuation: %v", err)
 	}
 	continuation := Continuation(wire)
 	normalizeContinuationContent(&continuation)

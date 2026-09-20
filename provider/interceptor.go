@@ -186,6 +186,7 @@ func cloneRequest(request Request) Request {
 	request.StopSequences = slices.Clone(request.StopSequences)
 	if request.ResponseFormat != nil {
 		responseFormat := *request.ResponseFormat
+		responseFormat.RawSchema = append(json.RawMessage(nil), request.ResponseFormat.RawSchema...)
 		if request.ResponseFormat.Schema != nil {
 			schema := cloneJSONSchema(*request.ResponseFormat.Schema)
 			responseFormat.Schema = &schema

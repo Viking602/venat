@@ -6,6 +6,10 @@
 
 Venat is a typed Go SDK for bounded Agent loops, application-defined multi-Agent orchestration, and optional crash-safe execution. Applications import the packages they need and retain ownership of identity, routing policy, storage schema, deployment, and operations.
 
+For command-error correction, typed input, native JSON output, context fitting,
+and live user input, see [Agent execution](docs/agent-execution.md) and run
+`go run ./examples/interactive` for a credential-free local smoke scenario.
+
 > **Status:** The latest published release is [v0.16.1](https://github.com/Viking602/venat/releases/tag/v0.16.1). Public APIs may change before v1.0.
 
 ## Packages

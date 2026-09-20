@@ -30,6 +30,10 @@ const (
 // operation started. Durable action recovery may safely record it as failed.
 var ErrNotExecuted = errors.New("tool operation was not executed")
 
+// ErrToolTimeout is the cause of a tool-local deadline, distinct from cancellation
+// of its caller. Only a driver with confirmed termination may turn it into feedback.
+var ErrToolTimeout = errors.New("tool-local deadline exceeded")
+
 const (
 	ConcurrencyParallel   = message.ToolConcurrencyParallel
 	ConcurrencySequential = message.ToolConcurrencySequential
@@ -374,9 +378,14 @@ func (b *Bus) Driver(name string) (Driver, bool) {
 	return driver, ok
 }
 
+// Execute returns unknown names and invalid arguments as completed IsError
+// results. Driver/infrastructure errors remain Go errors and stop a batch.
 func (b *Bus) Execute(ctx context.Context, call Call, options ExecuteOptions) (Result, error) {
 	if err := b.Validate(); err != nil {
 		return Result{}, err
+	}
+	if err := ctx.Err(); err != nil {
+		return Result{}, errors.Join(ErrNotExecuted, err)
 	}
 	b.mu.RLock()
 	driver, ok := b.drivers[call.Name]
@@ -386,25 +395,18 @@ func (b *Bus) Execute(ctx context.Context, call Call, options ExecuteOptions) (R
 	limiter := b.limiters[key]
 	b.mu.RUnlock()
 	if !ok {
-		return Result{}, fmt.Errorf("%w: %s", ErrToolNotFound, call.Name)
+		return rejectedCall(call, fmt.Errorf("%w: %s; choose an available tool", ErrToolNotFound, call.Name)), nil
 	}
 	if validation.err != nil {
 		return Result{}, validation.err
 	}
 	if err := validation.validate(call.Arguments); err != nil {
-		result := Result{
-			ToolCallID: call.ID,
-			Name:       call.Name,
-			Content:    fmt.Sprintf("%s rejected: %v", call.Name, err),
-			IsError:    true,
-		}
-		result.SyncLegacyContent()
-		return result, nil
+		return rejectedCall(call, err), nil
 	}
 	definition = cloneDefinition(definition)
 	if definition.Timeout > 0 {
 		var cancel context.CancelFunc
-		ctx, cancel = context.WithTimeout(ctx, definition.Timeout)
+		ctx, cancel = context.WithTimeoutCause(ctx, definition.Timeout, ErrToolTimeout)
 		defer cancel()
 	}
 	release, err := limiter.acquire(ctx)
@@ -418,6 +420,15 @@ func (b *Bus) Execute(ctx context.Context, call Call, options ExecuteOptions) (R
 		return terminal.Execute(ctx, cloneCall(call), options.Sink)
 	}
 	return interceptor.Execute(ctx, terminal, call, options.Sink)
+}
+
+func rejectedCall(call Call, err error) Result {
+	result := Result{
+		ToolCallID: call.ID, Name: call.Name,
+		Content: fmt.Sprintf("%s rejected: %v", call.Name, err), IsError: true,
+	}
+	result.SyncLegacyContent()
+	return result
 }
 
 func (b *Bus) ExecuteBatch(ctx context.Context, calls []Call, mode Mode, options ExecuteOptions) ([]Result, error) {

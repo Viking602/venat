@@ -556,7 +556,6 @@ func TestAgentTool_ReturnsTextStructuredAndTerminalFallback(t *testing.T) {
 					message.FinalAnswerPart("answer"),
 				},
 				Structured: json.RawMessage(`{"accepted":true}`),
-				IsError:    true,
 			},
 		}
 		child := Engine{
@@ -589,7 +588,7 @@ func TestAgentTool_ReturnsTextStructuredAndTerminalFallback(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Execute() error = %v", err)
 		}
-		if terminal.calls != 1 || !result.IsError || result.Content != "terminal answer" {
+		if terminal.calls != 1 || result.IsError || result.Content != "terminal answer" {
 			t.Fatalf("Execute() result = %#v, terminal calls = %d", result, terminal.calls)
 		}
 		if len(result.Parts) != 2 || result.Parts[0].Text != "terminal " || result.Parts[1].Text != "answer" {
@@ -647,8 +646,8 @@ func TestAgentTool_ReturnsTextStructuredAndTerminalFallback(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Execute() error = %v", err)
 		}
-		want := `subagent "researcher" completed without a final answer`
-		if !result.IsError || result.Content != want || strings.Contains(result.Content, observation.result.Content) {
+		want := `agent response remained incomplete`
+		if !result.IsError || !strings.Contains(result.Content, want) || strings.Contains(result.Content, observation.result.Content) {
 			t.Fatalf("Execute() result = %#v", result)
 		}
 	})
@@ -755,8 +754,8 @@ func TestAgentTool_MapsFailureAndIncompleteRuns(t *testing.T) {
 			}), nil
 		})})
 		result := execute(t, driver)
-		want := `subagent "researcher" completed without a final answer`
-		if !result.IsError || result.Content != want {
+		want := `agent response remained incomplete`
+		if !result.IsError || !strings.Contains(result.Content, want) {
 			t.Fatalf("Execute() result = %#v", result)
 		}
 	})

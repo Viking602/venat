@@ -24,6 +24,9 @@ Important contracts:
 - Conformance helpers validate event order, usage, terminal behavior, and adapter normalization.
 - `OpenRetryingStream` uses `StreamRetryOptions.ShouldRetry` only for open or pre-first-event failures; context cancellation, deadlines, and emitted output are hard stops.
 - A receive or terminal failure after valid output is a non-retryable `PartialStreamError` that preserves the cause.
+- `WithStreamIdleTimeout` closes an idle stream and returns `ErrStreamIdleTimeout`;
+  Agent model policies also expose typed connection and total-request timeout
+  errors.
 
 Provider-specific adapters remain under `provider/<adapter>`.
 
@@ -41,8 +44,13 @@ Important contracts:
 - The Bus deep-clones updates, overwrites call identity, assigns per-call `Sequence`, serializes a shared parallel sink, and applies synchronous backpressure.
 - One call is limited to 65,536 updates and 64 MiB of decoded update data. Invalid lifecycle/content returns `ErrToolUpdateProtocol`; overflow returns `ErrToolUpdateLimit`.
 - Streamed output parts become the final result when `Result.Parts` is absent and must match when it is present. `Result.IsError` remains a completed business result.
+- Unknown names and invalid arguments are error results; rejected calls still
+  consume the Agent call budget. Terminal tools finish only after a successful
+  result. `kit.Tool` preserves explicit Result outputs and confirmed process exit
+  feedback; ordinary Go errors retain their infrastructure semantics. See
+  [error boundaries](agent-execution.md#recoverable-feedback-and-fatal-boundaries).
 
-`tool/kit` contains application-neutral function, HTTP, process, adapter, and bundle helpers. External protocol bridges belong in separate adapter modules.
+`tool/kit` contains application-neutral function, HTTP, process, adapter, and bundle helpers. `ContextSelectionTool` and `ContextSelectionConfig` compose llmux's external TypeSafe transport into an optional typed scoring tool. `BuildDeps.ContextSelection` exposes it only when `select_context` is named in `Spec.Tools`; see [explicit Jev setup](agent-execution.md#explicit-jev-context-scoring). External wire-protocol implementations remain in their adapter modules.
 
 Function tools may accept an `UpdateSink`. Process tools emit `UpdateOutput` as stdout/stderr is read. Drivers that never invoke the sink retain one-shot behavior.
 
@@ -65,8 +73,11 @@ Primary inputs and outputs:
 
 ```go
 type Request struct {
-    Prompt string
-    Budget *Budget
+    Prompt        string
+    Budget        *Budget
+    SessionBudget *SessionBudget
+    ModelTimeouts *ModelTimeoutPolicy
+    Content       []message.ContentPart
 }
 
 type Result struct {
@@ -87,6 +98,27 @@ Primary entry points:
 - `Engine.Run` / `Engine.RunStream`
 - `Engine.Resume` / `Engine.ResumeStream`
 - low-level `Engine.RunMessages`
+
+`Request.Validate` and `ValidateOutputPolicy` preflight inputs without performing
+effects; orchestration and durable admission use the same checks. Typed user
+content supports text, images, audio, and files, subject to provider support.
+
+`SessionBudget` is persisted with a continuation and bounds cumulative session
+tokens and active wall-clock time. `Budget` remains the per-Engine execution
+budget. `ModelTimeouts` follows the Codex provider shape: 15 seconds for stream
+connection, 5 minutes of stream-idle time, and an optional total model-request
+deadline. Set `DisableDefaults` to use only explicitly supplied durations.
+
+`OutputPolicy.Native` explicitly opts into native JSON Schema forwarding;
+`Validate` and `Repair` retain their local semantics. `ResponseFormat.RawSchema`
+preserves values such as numeric enums and takes precedence over its legacy
+typed `Schema`. The OpenAI Chat and Responses adapters forward it.
+
+A positive `ContextTokenTarget` with no custom compactor now enables conservative
+text-only request fitting. The full execution transcript is retained. `Control`
+adds bounded live user input and cancellation to a single execution. See
+[execution behavior and examples](agent-execution.md) for acknowledgement,
+context, compatibility, and recovery limits.
 
 `AgentToolConfig` and `NewAgentTool` expose an already configured child
 `Engine` as a non-terminal `tool.Driver`.
@@ -135,7 +167,7 @@ A `Continuation` records the complete provider-neutral state at one of four phas
 `Executor.Execute` performs one dispatch. `Drive` provides only mechanical behavior:
 
 - validation and globally unique dispatch IDs
-- bounded ticks and concurrency
+- bounded ticks, concurrency, Drive wall-clock, and per-dispatch deadlines
 - context cancellation and panic containment
 - deterministic success folding and multi-error ordering
 - source-labeled serialized output frames

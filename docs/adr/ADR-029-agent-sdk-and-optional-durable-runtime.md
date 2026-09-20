@@ -9,6 +9,10 @@ remains the live architecture authority for the breaking cutover from the
 platform-shaped v0.16 candidate to a small Agent SDK with optional
 orchestration and durability.
 
+Amended — 2026-09-20 to add typed user content, native structured-output hints,
+default provider-context fitting, and execution-scoped input/cancellation.
+These remain Agent mechanisms; application integration is a separate phase.
+
 This decision supersedes the live recommendations from ADR-017, ADR-020,
 ADR-024, ADR-025, ADR-027, and ADR-028 where they prescribe the root Runner,
 the five-layer platform, Harness/session persistence, or platform storage
@@ -92,7 +96,7 @@ remain.
 | Old surface | New surface or disposition |
 | --- | --- |
 | Root `venat.Runner` and domain façades | Delete; applications import and compose the target packages directly |
-| `api.Task` | `agent.Request` with only `Prompt` and optional `Budget` |
+| `api.Task` | `agent.Request` with `Prompt`, typed user `Content`, and optional `Budget` |
 | `api.TaskBudget` | `agent.Budget` |
 | Platform task/run IDs, status, identity, and agent definitions | Delete from the SDK; application-owned |
 | `multiagent` | Replace with policy-free `orchestration` protocols |
@@ -123,6 +127,15 @@ snapshot validated before `Resume`; invalid durable snapshots fail as corrupt
 rather than being guessed or repaired. Synchronous boundary observation occurs
 before each externally significant transition and fails closed before the next
 effect.
+
+`agent.Control` belongs to one execution and accepts only authorized user input.
+It has a bounded in-memory queue, acknowledges consumption after safe boundary
+observers succeed, and cancels the execution context. It is not a registry or
+mailbox, cannot inject peer/tool output, and does not promise exactly-once input
+delivery. Applications own authorization and routing to the right handle.
+Default context fitting retains the full recovery transcript and trims only the
+provider-facing view. See [Agent execution](../agent-execution.md) and the
+[continuation wire contract](../durable-execution.md) for compatibility details.
 
 Each logical provider request and tool call carries a stable `OperationID`.
 Provider and tool interceptors may call their next effect zero or one time and

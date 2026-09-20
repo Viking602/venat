@@ -68,10 +68,8 @@ func NewAgentTool(child Engine, config AgentToolConfig) (tool.Driver, error) {
 	}
 
 	policy := cloneAgentToolOutputPolicy(config.OutputPolicy)
-	if policy.Validate && len(policy.Schema) > 0 {
-		if _, err := parseOutputPolicySchema(policy.Schema); err != nil {
-			return nil, fmt.Errorf("%w: agent tool %q output schema: %w", tool.ErrInvalidToolDefinition, definition.Name, err)
-		}
+	if err := ValidateOutputPolicy(policy); err != nil {
+		return nil, fmt.Errorf("%w: agent tool %q output schema: %w", tool.ErrInvalidToolDefinition, definition.Name, err)
 	}
 
 	validation := tool.NewBus(agentToolValidationDriver{definition: definition})

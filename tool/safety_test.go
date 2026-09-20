@@ -2,7 +2,6 @@ package tool
 
 import (
 	"context"
-	"errors"
 	"testing"
 )
 
@@ -29,14 +28,14 @@ func TestUnsafeToolSelection(t *testing.T) {
 	bus := NewBus(safe, dangerous)
 	restricted := bus.Subset([]string{"safe"})
 
-	if _, err := restricted.Execute(context.Background(), Call{Name: "dangerous"}, ExecuteOptions{}); !errors.Is(err, ErrToolNotFound) {
-		t.Fatalf("expected dangerous tool to be blocked, got %v", err)
+	if result, err := restricted.Execute(context.Background(), Call{Name: "dangerous"}, ExecuteOptions{}); err != nil || !result.IsError {
+		t.Fatalf("expected dangerous tool to be rejected, got %+v, %v", result, err)
 	}
 	if dangerous.calls != 0 {
 		t.Fatalf("expected dangerous tool to remain uncalled, got %d", dangerous.calls)
 	}
-	if _, err := restricted.ExecuteBatch(context.Background(), []Call{{Name: "safe"}, {Name: "dangerous"}}, ModeSequential, ExecuteOptions{}); !errors.Is(err, ErrToolNotFound) {
-		t.Fatalf("expected mixed misuse batch to fail, got %v", err)
+	if results, err := restricted.ExecuteBatch(context.Background(), []Call{{Name: "safe"}, {Name: "dangerous"}}, ModeSequential, ExecuteOptions{}); err != nil || len(results) != 2 || !results[1].IsError {
+		t.Fatalf("expected rejected slot in mixed batch, got %+v, %v", results, err)
 	}
 	if safe.calls != 1 {
 		t.Fatalf("expected safe tool to run once before denial, got %d", safe.calls)

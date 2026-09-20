@@ -568,15 +568,9 @@ func TestRunMessagesReportsIterationWhenToolDriverPanics(t *testing.T) {
 	}
 }
 
-// TestRunMessagesDoesNotChargeUnregisteredTool pins that a model turn naming a
-// tool the bus does not have is treated as tool_unavailable: nothing is
-// dispatched, so nothing is charged. ExecuteBatch returns ErrToolNotFound before
-// entering any driver, so charging the batch would debit MaxToolCalls for a call
-// that never ran — a caller that registers the tool and resumes would then
-// under-budget. The loop must validate availability before charging, mirroring
-// its existing ErrToolBusMissing check, so this dispatched-nothing turn leaves
-// ToolCallsUsed at zero.
-func TestRunMessagesDoesNotChargeUnregisteredTool(t *testing.T) {
+// Rejected model calls consume the dispatch budget so repeated invalid names
+// cannot bypass the bound even though no driver was invoked.
+func TestRunMessagesChargesRejectedCallsAndContinues(t *testing.T) {
 	realDriver, err := kit.Tool("real", func(_ context.Context, _ struct{}) (string, error) {
 		return "ok", nil
 	})
@@ -593,6 +587,9 @@ func TestRunMessagesDoesNotChargeUnregisteredTool(t *testing.T) {
 			},
 		},
 		{Kind: provider.EventDone, StopReason: provider.StopReasonToolUse},
+	}, {
+		{Kind: provider.EventTextDelta, Text: "corrected"},
+		{Kind: provider.EventDone, StopReason: provider.StopReasonComplete},
 	}}}
 	engine := Engine{
 		Provider: driver,
@@ -607,15 +604,14 @@ func TestRunMessagesDoesNotChargeUnregisteredTool(t *testing.T) {
 		ToolMode:      tool.ModeSequential,
 	})
 
-	if runErr == nil || !errors.Is(runErr, tool.ErrToolNotFound) {
-		t.Fatalf("expected ErrToolNotFound for an unregistered tool, got %v", runErr)
+	if runErr != nil {
+		t.Fatal(runErr)
 	}
-	// No driver was entered, so the budget must not be debited.
-	if out.ToolCallsUsed != 0 {
-		t.Fatalf("ToolCallsUsed = %d, want 0 (an unregistered tool is never dispatched, so it must not be charged)", out.ToolCallsUsed)
+	if out.ToolCallsUsed != 1 {
+		t.Fatalf("ToolCallsUsed = %d, want 1 rejected attempt", out.ToolCallsUsed)
 	}
-	if out.StopReason != provider.StopReasonError {
-		t.Fatalf("StopReason = %s, want %s", out.StopReason, provider.StopReasonError)
+	if out.StopReason != provider.StopReasonComplete || len(driver.requests) != 2 {
+		t.Fatalf("StopReason = %s, calls=%d", out.StopReason, len(driver.requests))
 	}
 }
 

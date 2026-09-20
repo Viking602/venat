@@ -5,8 +5,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os/exec"
 	"reflect"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/Viking602/venat/message"
@@ -87,6 +89,9 @@ func ChainMiddlewares(driver tool.Driver, middlewares ...Middleware) tool.Driver
 	return current
 }
 
+// Tool wraps a typed function. Return tool.Result with IsError for a completed
+// domain failure the model can correct. Ordinary Go errors remain fatal, except
+// a confirmed exec.ExitError with an active context becomes process feedback.
 func Tool(name string, fn any, options ...ToolOption) (tool.Driver, error) {
 	if strings.TrimSpace(name) == "" {
 		return nil, errors.New("tool name is required")
@@ -170,40 +175,74 @@ func (t *functionTool) Definition() tool.Definition {
 }
 
 func (t *functionTool) Execute(ctx context.Context, call tool.Call, sink tool.UpdateSink) (tool.Result, error) {
+	if err := ctx.Err(); err != nil {
+		return tool.Result{}, errors.Join(tool.ErrNotExecuted, err)
+	}
 	inputValue, err := decodeInput(t.inputType, call.Arguments)
 	if err != nil {
-		return tool.Result{}, err
+		return resultFromPayload(call, []byte(fmt.Sprintf("%s rejected: %v", call.Name, err)), true), nil
 	}
 	args := make([]reflect.Value, 0, 3)
 	if t.wantsCtx {
 		args = append(args, reflect.ValueOf(ctx))
 	}
 	args = append(args, inputValue)
+	var outputStreamed atomic.Bool
 	if t.wantsSink {
-		if sink == nil {
-			sink = func(tool.Update) error { return nil }
-		}
-		args = append(args, reflect.ValueOf(sink))
+		forward := tool.UpdateSink(func(update tool.Update) error {
+			if update.Kind == tool.UpdateOutput {
+				outputStreamed.Store(true)
+			}
+			if sink != nil {
+				return sink(update)
+			}
+			return nil
+		})
+		args = append(args, reflect.ValueOf(forward))
 	}
 	values := t.fn.Call(args)
+	var exited *exec.ExitError
 	if errValue := values[1].Interface(); errValue != nil {
-		return tool.Result{}, errValue.(error)
+		executionErr := errValue.(error)
+		exited = completedProcessExit(executionErr)
+		if ctx.Err() != nil || exited == nil {
+			return tool.Result{}, errors.Join(executionErr, ctx.Err())
+		}
 	}
 	output := values[0].Interface()
-	structured, err := json.Marshal(output)
-	if err != nil {
-		return tool.Result{}, err
+	result, explicit := output.(tool.Result)
+	if explicit {
+		result = message.CloneToolResult(result)
+	} else {
+		structured, err := json.Marshal(output)
+		if err != nil {
+			return tool.Result{}, err
+		}
+		result = tool.Result{Content: string(structured), Structured: structured}
+		if t.outputType.Kind() == reflect.String {
+			result.Content = values[0].String()
+		}
 	}
-	content := string(structured)
-	if t.outputType.Kind() == reflect.String {
-		content = values[0].String()
+	result.ToolCallID, result.Name = call.ID, call.Name
+	if exited != nil {
+		suffix := "\n" + processExitDescription(exited)
+		if len(exited.Stderr) > 0 {
+			suffix += "\n" + string(exited.Stderr)
+		}
+		if sink != nil && outputStreamed.Load() {
+			if err := sink(tool.Update{Kind: tool.UpdateOutput, Parts: []message.ContentPart{message.TextPart(suffix)}}); err != nil {
+				return tool.Result{}, err
+			}
+		}
+		if len(result.Parts) > 0 {
+			result.Parts = append(result.Parts, message.TextPart(suffix))
+			result.SyncLegacyContent()
+		} else {
+			result.Content += suffix
+		}
+		result.IsError = true
 	}
-	return tool.Result{
-		ToolCallID: call.ID,
-		Name:       call.Name,
-		Content:    content,
-		Structured: structured,
-	}, nil
+	return result, nil
 }
 
 func decodeInput(target reflect.Type, payload json.RawMessage) (reflect.Value, error) {
