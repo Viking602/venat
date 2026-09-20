@@ -75,7 +75,7 @@ coupling, and god files.
 ## Impact
 
 `make architecture-check` fails new imports that cross the added seams.
-Docs and `CLAUDE.md` say five layers.
+Docs and `AGENTS.md` say five layers.
 
 ## References
 
