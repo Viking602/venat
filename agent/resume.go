@@ -24,7 +24,31 @@ func (e Engine) resume(ctx context.Context, continuation Continuation, sink Sink
 	if err := ValidateContinuation(continuation); err != nil {
 		return Result{Failure: (&AgentFailure{Kind: FailureKindEngineError, Reason: err.Error()}).WithCause(err)}
 	}
-	continuation = cloneContinuation(continuation)
+	continuation = currentContinuation(continuation)
+	if continuation.Request.SessionBudget == nil {
+		continuation.Request.SessionBudget = cloneSessionBudget(e.LoopPolicy.SessionBudget)
+	}
+	if continuation.Request.ModelTimeouts == nil {
+		resolved := e.modelTimeouts(continuation.Request)
+		continuation.Request.ModelTimeouts = &resolved
+	}
+	if err := continuation.Request.Validate(); err != nil {
+		result := continuationResult(continuation)
+		result.Failure = (&AgentFailure{Kind: FailureKindEngineError, Reason: err.Error()}).WithCause(err)
+		return result
+	}
+	format, policyErr := prepareOutputPolicy(continuation.OutputPolicy)
+	if policyErr != nil {
+		result := continuationResult(continuation)
+		result.Failure = schemaInvalidFailure(policyErr)
+		return result
+	}
+	controlledCtx, finish, controlErr := e.Control.start(ctx)
+	if controlErr != nil {
+		return resultWithFailure(ctx, continuationResult(continuation), controlErr, false)
+	}
+	defer finish()
+	ctx = controlledCtx
 	started := time.Now()
 	runCtx, cancelRun, budgetDriven := e.runContextWithElapsed(ctx, continuation.Request, continuation.ActiveElapsed)
 	defer cancelRun()
@@ -51,10 +75,12 @@ func (e Engine) resume(ctx context.Context, continuation Continuation, sink Sink
 		MaxTokens:            maxTokens,
 		MaxToolCalls:         maxToolCalls,
 		MaxSteps:             maxSteps,
+		ModelTimeouts:        e.modelTimeouts(continuation.Request),
 		ContextTokenTarget:   e.LoopPolicy.ContextTokenTarget,
 		OperationTurn:        continuation.NextOperationTurn,
 		StopSequences:        e.StopSequences,
 		ThinkingBudget:       e.ThinkingBudget,
+		ResponseFormat:       format,
 		ExtraBody:            e.ExtraBody,
 		PromptCacheKey:       e.PromptCacheKey,
 		ServiceTier:          e.ServiceTier,
@@ -63,6 +89,8 @@ func (e Engine) resume(ctx context.Context, continuation Continuation, sink Sink
 		OutputGuardrails:     e.OutputGuardrails,
 		OutputObserver:       e.OutputObserver,
 		Sink:                 sink,
+		Control:              e.Control,
+		controlBound:         true,
 		StepDecider:          e.StepDecider,
 		StepObserver:         e.StepObserver,
 		Compact:              compact,
@@ -92,6 +120,15 @@ func (e Engine) resume(ctx context.Context, continuation Continuation, sink Sink
 		return result
 	}
 	return e.validateAndRepairStructuredOutput(runCtx, input, output, result, policy, budgetDriven)
+}
+
+// The backend verifies the original version/hash before invoking Resume. This
+// pure upgrade affects only execution-owned memory; the next boundary atomically
+// writes a current-version continuation and its new hash through the backend.
+func currentContinuation(value Continuation) Continuation {
+	value = cloneContinuation(value)
+	value.SchemaVersion = ContinuationSchemaVersion
+	return value
 }
 
 func (e Engine) resumeLoop(ctx context.Context, input LoopInput, continuation Continuation) (LoopOutput, error) {

@@ -11,13 +11,14 @@ import (
 	"github.com/Viking602/venat/tool/kit"
 )
 
-// An unavailable tool is a factual tool_unavailable failure. Applications
-// choose whether to retry, reroute, or stop.
-func TestEngineRunClassifiesUnavailableToolAsToolUnavailable(t *testing.T) {
+func TestEngineRunFeedsUnavailableToolBackToModel(t *testing.T) {
 	toolCallTurn := func(name string) [][]provider.Event {
 		return [][]provider.Event{{
 			{Kind: provider.EventToolCall, ToolCall: &message.ToolCall{ID: "call-1", Name: name}},
 			{Kind: provider.EventDone, StopReason: provider.StopReasonToolUse},
+		}, {
+			{Kind: provider.EventTextDelta, Text: "use the available information"},
+			{Kind: provider.EventDone, StopReason: provider.StopReasonComplete},
 		}}
 	}
 	lookupBus := func(t *testing.T) *tool.Bus {
@@ -44,18 +45,17 @@ func TestEngineRunClassifiesUnavailableToolAsToolUnavailable(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			engine := Engine{Provider: &scriptedProvider{turns: toolCallTurn(tt.call)}, Tools: tt.bus}
+			driver := &scriptedProvider{turns: toolCallTurn(tt.call)}
+			engine := Engine{Provider: driver, Tools: tt.bus}
 
 			result := engine.Run(context.Background(), Request{Prompt: "use a tool"}, OutputPolicy{})
 
-			if result.Failure == nil {
-				t.Fatal("expected a failure for an unavailable tool")
+			if result.Failure != nil || len(driver.requests) != 2 {
+				t.Fatalf("result=%+v", result)
 			}
-			if result.Failure.Kind != FailureKindToolUnavailable {
-				t.Fatalf("Failure.Kind = %s, want %s", result.Failure.Kind, FailureKindToolUnavailable)
-			}
-			if result.Failure.Reason == "" {
-				t.Fatal("tool_unavailable failure must retain its reason")
+			messages := driver.requests[1].Messages
+			if feedback := messages[len(messages)-1].ToolResult; feedback == nil || !feedback.IsError || feedback.Name != tt.call {
+				t.Fatalf("feedback=%+v", feedback)
 			}
 		})
 	}

@@ -497,7 +497,9 @@ func responsesTextFromRequest(format *provider.ResponseFormat) *responsesText {
 	if format.Type == "json_schema" {
 		payload["name"] = format.Name
 		payload["strict"] = format.Strict
-		if format.Schema != nil {
+		if len(format.RawSchema) > 0 {
+			payload["schema"] = format.RawSchema
+		} else if format.Schema != nil {
 			payload["schema"] = format.Schema
 		}
 	}

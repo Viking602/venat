@@ -22,6 +22,11 @@ var (
 	ErrSchedulerPanic = errors.New("orchestration: scheduler panic")
 	// ErrExecutorPanic reports a panic contained at the Executor boundary.
 	ErrExecutorPanic = errors.New("orchestration: executor panic")
+	// ErrMaxWallClock reports that one Drive invocation exceeded its wall-clock
+	// envelope.
+	ErrMaxWallClock = errors.New("orchestration: maximum wall clock reached")
+	// ErrDispatchTimeout reports one dispatch that exceeded its local deadline.
+	ErrDispatchTimeout = errors.New("orchestration: dispatch timeout")
 )
 
 // Scheduler is a pure scheduling function over the supplied State snapshot.
@@ -58,20 +63,17 @@ type Dispatch struct {
 // ValidateDispatch validates the mechanical dispatch contract without
 // interpreting Route, Handoff, or Metadata.
 func ValidateDispatch(dispatch Dispatch) error {
+	if err := dispatch.Request.Validate(); err != nil {
+		return fmt.Errorf("%w: %w", ErrInvalidArgument, err)
+	}
+	if err := agent.ValidateOutputPolicy(dispatch.OutputPolicy); err != nil {
+		return fmt.Errorf("%w: %w", ErrInvalidArgument, err)
+	}
 	if strings.TrimSpace(dispatch.ID) == "" {
 		return fmt.Errorf("%w: dispatch ID is empty", ErrInvalidArgument)
 	}
 	if strings.TrimSpace(dispatch.Route) == "" {
 		return fmt.Errorf("%w: dispatch %q route is empty", ErrInvalidArgument, dispatch.ID)
-	}
-	if dispatch.Request.Budget != nil {
-		budget := dispatch.Request.Budget
-		if budget.MaxTokens < 0 || budget.MaxToolCalls < 0 || budget.MaxSteps < 0 || budget.MaxWallClock < 0 {
-			return fmt.Errorf("%w: dispatch %q has a negative budget", ErrInvalidArgument, dispatch.ID)
-		}
-	}
-	if dispatch.OutputPolicy.MaxRepairAttempts < 0 {
-		return fmt.Errorf("%w: dispatch %q has a negative repair limit", ErrInvalidArgument, dispatch.ID)
 	}
 	if len(dispatch.OutputPolicy.Schema) > 0 && !json.Valid(dispatch.OutputPolicy.Schema) {
 		return fmt.Errorf("%w: dispatch %q output schema is invalid JSON", ErrInvalidArgument, dispatch.ID)

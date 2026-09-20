@@ -159,7 +159,7 @@ func TestRunMessagesStepDecisionFinishOnTerminalTool(t *testing.T) {
 
 func TestEngineRepairConcatenatesStepsWithGlobalReindex(t *testing.T) {
 	// Initial run returns enum-invalid output; the single repair run fixes it.
-	// Each run is one finishing turn, so the merged trace must be two steps
+	// The initial output continues into repair, so the merged trace is two steps
 	// with globally continuous indices 0 and 1 — not two index-0 collisions.
 	_, engine := newOutputPolicyEngine(
 		`{"status":"blocked","score":0.75,"count":2,"tags":["risk"],"accepted":true}`,
@@ -184,8 +184,12 @@ func TestEngineRepairConcatenatesStepsWithGlobalReindex(t *testing.T) {
 		if step.Index != i {
 			t.Fatalf("step %d has Index %d; repair steps must be globally reindexed", i, step.Index)
 		}
-		if step.Decision != StepDecisionFinish {
-			t.Fatalf("step %d Decision = %s, want finish", i, step.Decision)
+		want := StepDecisionFinish
+		if i == 0 {
+			want = StepDecisionContinue
+		}
+		if step.Decision != want {
+			t.Fatalf("step %d Decision = %s, want %s", i, step.Decision, want)
 		}
 	}
 }

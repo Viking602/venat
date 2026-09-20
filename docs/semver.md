@@ -14,22 +14,17 @@ Runtime correctness has higher priority than benchmark breadth. When a change ti
 
 Stable packages:
 
-- `venat`
-- `api`
 - `agent`
-- `blackboard`
-- `flow`
-- `hook`
 - `message`
-- `policy`
 - `provider`
 - `tool`
-- `transport/mcp`
-- `worker`
+- `skill`
+- `orchestration`
+- `durable` (including the backend conformance helpers in `durable/contract`)
 
 Implementation-detail packages:
 
-- `internal/*`
+- `durable/internal/*`
 - `tool/tooltest`
 
 Archived v1 packages are not part of the current public import surface.
@@ -40,8 +35,8 @@ Archived v1 packages are not part of the current public import surface.
 - Removing public fields, renaming them, or changing their meaning requires a major version.
 - Event payloads may add fields.
 - Event type renames or removals require a major version.
-- CLI may add inspection flags and subcommands.
-- Removing CLI flags or changing their behavior incompatibly requires a major version.
+- Persisted continuation compatibility is versioned independently of Go source
+  compatibility. See [wire rollout rules](durable-execution.md#wire-version-and-rollout).
 
 ## Release Gate
 

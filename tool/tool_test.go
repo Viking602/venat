@@ -53,8 +53,8 @@ func TestBusSubsetKeepsExplicitlyGrantedTools(t *testing.T) {
 	if definitions[0].Name != "beta" {
 		t.Fatalf("expected granted tool beta, got %#v", definitions[0])
 	}
-	if _, err := subset.Execute(context.Background(), Call{Name: "alpha"}, ExecuteOptions{}); err == nil {
-		t.Fatalf("expected denied tool to be unavailable")
+	if result, err := subset.Execute(context.Background(), Call{Name: "alpha"}, ExecuteOptions{}); err != nil || !result.IsError {
+		t.Fatalf("expected denied tool to be rejected: %+v, %v", result, err)
 	}
 	result, err := subset.Execute(context.Background(), Call{Name: "beta", Arguments: message.ToolCall{}.Arguments}, ExecuteOptions{})
 	if err != nil {

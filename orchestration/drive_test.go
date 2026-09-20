@@ -7,6 +7,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/Viking602/venat/agent"
 )
@@ -169,6 +170,48 @@ func TestDriveContainsExecutorPanicWithZeroPartialResult(t *testing.T) {
 	}
 	if state.Tick != 0 || len(state.Outcomes) != 0 {
 		t.Fatalf("state = %#v, want no folded panic outcome", state)
+	}
+}
+
+func TestDriveMaxWallClockReturnsTypedLimit(t *testing.T) {
+	started := make(chan struct{})
+	state, err := Drive(context.Background(), oneTickScheduler("slow"), ExecutorFunc(func(ctx context.Context, _ Dispatch, _ agent.Sink) (agent.Result, error) {
+		close(started)
+		<-ctx.Done()
+		return agent.Result{}, ctx.Err()
+	}), DriveOptions{MaxWallClock: 10 * time.Millisecond})
+	if !errors.Is(err, ErrMaxWallClock) {
+		t.Fatalf("Drive() error = %v, want ErrMaxWallClock", err)
+	}
+	if state.Tick != 0 {
+		t.Fatalf("state tick = %d, want 0", state.Tick)
+	}
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("executor did not start")
+	}
+}
+
+func TestDriveDispatchTimeoutReturnsTypedLimit(t *testing.T) {
+	_, err := Drive(context.Background(), oneTickScheduler("slow"), ExecutorFunc(func(ctx context.Context, _ Dispatch, _ agent.Sink) (agent.Result, error) {
+		<-ctx.Done()
+		return agent.Result{}, ctx.Err()
+	}), DriveOptions{DispatchTimeout: 10 * time.Millisecond})
+	if !errors.Is(err, ErrDispatchTimeout) {
+		t.Fatalf("Drive() error = %v, want ErrDispatchTimeout", err)
+	}
+}
+
+func TestDriveMaxWallClockBoundsScheduler(t *testing.T) {
+	_, err := Drive(context.Background(), SchedulerFunc(func(context.Context, State) ([]Dispatch, error) {
+		time.Sleep(20 * time.Millisecond)
+		return nil, nil
+	}), ExecutorFunc(func(context.Context, Dispatch, agent.Sink) (agent.Result, error) {
+		return agent.Result{}, nil
+	}), DriveOptions{MaxWallClock: 10 * time.Millisecond})
+	if !errors.Is(err, ErrMaxWallClock) {
+		t.Fatalf("Drive() error = %v, want ErrMaxWallClock", err)
 	}
 }
 

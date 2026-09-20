@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"io"
 	"math/big"
+
+	"github.com/Viking602/venat/provider"
 )
 
 // ValidateJSON validates payload against the supported JSON Schema subset used
@@ -23,15 +25,15 @@ func ValidateJSON(schemaRaw, payload json.RawMessage) error {
 	return err
 }
 
-// OutputPolicy controls structured-output validation and schema repair
-// after each agent loop completion. Engine.Run honors Validate; the
-// Repair loop with MaxRepairAttempts is wired in Phase 2 (v0.8.0
-// scaffold surfaces FailureKindSchemaInvalid when Validate fails).
+// OutputPolicy controls structured-output validation and bounded repair.
+// Native opts into provider JSON Schema output through ResponseFormat; Validate
+// independently enables local validation. Existing policies remain local-only.
 type OutputPolicy struct {
 	Schema            json.RawMessage `json:"schema,omitempty"`
 	Validate          bool            `json:"validate,omitempty"`
 	Repair            bool            `json:"repair,omitempty"`
 	MaxRepairAttempts int             `json:"maxRepairAttempts,omitempty"`
+	Native            bool            `json:"native,omitempty"`
 }
 
 type outputPolicySchema struct {
@@ -44,7 +46,39 @@ type outputPolicySchema struct {
 	AdditionalProperties *bool                         `json:"additionalProperties,omitempty"`
 }
 
+func prepareOutputPolicy(policy OutputPolicy) (*provider.ResponseFormat, error) {
+	if err := ValidateOutputPolicy(policy); err != nil {
+		return nil, err
+	}
+	if !policy.Native {
+		return nil, nil
+	}
+	return &provider.ResponseFormat{
+		Type: "json_schema", Name: "agent_output",
+		RawSchema: append(json.RawMessage(nil), policy.Schema...),
+	}, nil
+}
+
+// ValidateOutputPolicy checks static output configuration before an execution
+// or dispatch can perform effects. It does not validate an output value.
+func ValidateOutputPolicy(policy OutputPolicy) error {
+	if policy.MaxRepairAttempts < 0 {
+		return errors.New("negative repair attempt limit")
+	}
+	if policy.Native && len(policy.Schema) == 0 {
+		return errors.New("native output requires a schema")
+	}
+	if (!policy.Validate && !policy.Native) || len(policy.Schema) == 0 {
+		return nil
+	}
+	_, err := parseOutputPolicySchema(policy.Schema)
+	return err
+}
+
 func parseOutputPolicySchema(schemaRaw json.RawMessage) (outputPolicySchema, error) {
+	if err := validateContinuationJSONDocument(schemaRaw); err != nil {
+		return outputPolicySchema{}, fmt.Errorf("output schema is invalid JSON: %w", err)
+	}
 	var schema *outputPolicySchema
 	if err := decodeJSONUseNumber(schemaRaw, &schema); err != nil {
 		return outputPolicySchema{}, fmt.Errorf("output schema is invalid JSON: %w", err)

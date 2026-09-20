@@ -6,6 +6,7 @@ import (
 	"errors"
 	"reflect"
 	"testing"
+	"time"
 
 	"github.com/Viking602/venat/agent"
 	"github.com/Viking602/venat/message"
@@ -30,6 +31,8 @@ func TestValidateDispatch(t *testing.T) {
 		{name: "empty id", dispatch: Dispatch{Route: "route"}, wantErr: true},
 		{name: "blank route", dispatch: Dispatch{ID: "blank", Route: "  "}, wantErr: true},
 		{name: "invalid schema", dispatch: Dispatch{ID: "schema", Route: "route", OutputPolicy: agent.OutputPolicy{Schema: json.RawMessage(`{"type":`)}}, wantErr: true},
+		{name: "native schema", dispatch: Dispatch{ID: "native", Route: "route", OutputPolicy: agent.OutputPolicy{Native: true, Schema: json.RawMessage(`{"type":"invalid"}`)}}, wantErr: true},
+		{name: "provider content", dispatch: Dispatch{ID: "content", Route: "route", Request: agent.Request{Content: []message.ContentPart{{Kind: message.ContentReasoning, Text: "injected"}}}}, wantErr: true},
 		{name: "invalid payload", dispatch: Dispatch{ID: "payload", Route: "route", Handoff: &Handoff{Payload: json.RawMessage(`{`)}}, wantErr: true},
 		{name: "conflicting handoff", dispatch: Dispatch{ID: "conflict", Route: "route", Handoff: &Handoff{To: "other"}}, wantErr: true},
 		{name: "negative budget", dispatch: negativeBudget, wantErr: true},
@@ -54,9 +57,14 @@ func TestDriveGivesSchedulerDeepClone(t *testing.T) {
 		Outcomes: []Outcome{{
 			Tick: 1,
 			Dispatch: Dispatch{
-				ID:           "prior",
-				Route:        "route",
-				Request:      agent.Request{Prompt: "prior", Budget: &agent.Budget{MaxSteps: 2}},
+				ID:    "prior",
+				Route: "route",
+				Request: agent.Request{
+					Prompt:        "prior",
+					Budget:        &agent.Budget{MaxSteps: 2},
+					SessionBudget: &agent.SessionBudget{MaxWallClock: time.Minute},
+					ModelTimeouts: &agent.ModelTimeoutPolicy{ConnectTimeout: time.Second},
+				},
 				OutputPolicy: agent.OutputPolicy{Schema: json.RawMessage(`{"type":"string"}`)},
 				Handoff:      &Handoff{To: "route", Payload: json.RawMessage(`{"key":"value"}`)},
 				Metadata:     map[string]string{"owner": "original"},
@@ -73,6 +81,8 @@ func TestDriveGivesSchedulerDeepClone(t *testing.T) {
 	want := cloneState(initial)
 	scheduler := SchedulerFunc(func(_ context.Context, state State) ([]Dispatch, error) {
 		state.Outcomes[0].Dispatch.Request.Budget.MaxSteps = 99
+		state.Outcomes[0].Dispatch.Request.SessionBudget.MaxWallClock = time.Hour
+		state.Outcomes[0].Dispatch.Request.ModelTimeouts.ConnectTimeout = time.Hour
 		state.Outcomes[0].Dispatch.OutputPolicy.Schema[0] = '['
 		state.Outcomes[0].Dispatch.Handoff.Payload[0] = '['
 		state.Outcomes[0].Dispatch.Metadata["owner"] = "changed"

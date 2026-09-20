@@ -4,6 +4,9 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -29,6 +32,45 @@ func toolTurn(name string) func(context.Context, provider.Request) (provider.Str
 		},
 		provider.Event{Kind: provider.EventDone, StopReason: provider.StopReasonToolUse},
 	)
+}
+
+func TestRuntime_ReplaysSettledToolRejectionThenContinuesCorrection(t *testing.T) {
+	store := testbackend.New()
+	fault := &failSaveBackend{Backend: store, phase: agent.ContinuationToolsComplete}
+	first := newTestRuntime(t, fault, Options{OwnerID: "first"})
+	var calls atomic.Int32
+	action, err := kit.Tool("submit", func(context.Context, struct{}) (tool.Result, error) {
+		if calls.Add(1) == 1 {
+			return tool.Result{Content: "rejected: revise the result", IsError: true}, nil
+		}
+		return tool.Result{Content: "accepted"}, nil
+	}, kit.Terminal())
+	if err != nil {
+		t.Fatal(err)
+	}
+	driver := &runtimeProvider{responses: []func(context.Context, provider.Request) (provider.Stream, error){toolTurn("submit")}}
+	_, err = first.Start(context.Background(), "rejection", testEngine(driver, action), testRequest("submit"), agent.OutputPolicy{})
+	if !errors.Is(err, errInjectedBackend) || calls.Load() != 1 {
+		t.Fatalf("start error=%v calls=%d", err, calls.Load())
+	}
+	resumedModel := &runtimeProvider{responses: []func(context.Context, provider.Request) (provider.Stream, error){
+		func(ctx context.Context, request provider.Request) (provider.Stream, error) {
+			last := request.Messages[len(request.Messages)-1].ToolResult
+			if last == nil || !last.IsError || !strings.Contains(last.Content, "revise") {
+				return nil, errors.New("missing replayed rejection")
+			}
+			return toolTurn("submit")(ctx, request)
+		},
+	}}
+	second := newTestRuntime(t, store.Reopen(), Options{OwnerID: "second"})
+	result, err := second.Resume(context.Background(), "rejection", testEngine(resumedModel, action))
+	if err != nil || result.Failure != nil || calls.Load() != 2 || resumedModel.callCount() != 1 || result.Steps[0].Decision != agent.StepDecisionContinue || result.Steps[1].Decision != agent.StepDecisionFinish {
+		t.Fatalf("resume=%+v error=%v calls=%d", result, err, calls.Load())
+	}
+	execution, err := store.LoadExecution(context.Background(), "rejection")
+	if err != nil || execution.Status != ExecutionStatusCompleted {
+		t.Fatalf("execution=%+v error=%v", execution, err)
+	}
 }
 
 func TestRuntime_ToolFailureAfterUpdateBecomesUnknown(t *testing.T) {
@@ -236,4 +278,79 @@ func countFrameKind(frames []agent.Frame, kind agent.FrameKind) int {
 		}
 	}
 	return count
+}
+
+func TestRuntime_ContextSelectionReplaysAfterReopenWithoutNetwork(t *testing.T) {
+	var calls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		if r.URL.Path != "/v1/systemone" || r.Header.Get("Authorization") != "Bearer caller-secret" {
+			t.Error("wrong evaluation request")
+		}
+		_, _ = io.WriteString(w, `{"model":"jev-version","answers":{"log":{"type":"noul","noul":0.9}},"usage":{"input_tokens":12,"output_tokens":1}}`)
+	}))
+	defer server.Close()
+	action, err := kit.ContextSelectionTool("select_context", kit.ContextSelectionConfig{Protocol: "typesafe-system-one", BaseURL: server.URL + "/v1", APIKey: "caller-secret", Model: "jev-version"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	model := &runtimeProvider{responses: []func(context.Context, provider.Request) (provider.Stream, error){providerEvents(
+		provider.Event{Kind: provider.EventToolCall, ToolCall: &message.ToolCall{ID: "selection", Name: "select_context", Arguments: json.RawMessage(`{"task":"fix","candidates":[{"id":"log","text":"failure","protected":false}]}`)}},
+		provider.Event{Kind: provider.EventDone, StopReason: provider.StopReasonToolUse},
+	)}}
+	store := testbackend.New()
+	fault := &failSaveBackend{Backend: store, phase: agent.ContinuationToolsComplete}
+	first := newTestRuntime(t, fault, Options{OwnerID: "first"})
+	_, err = first.Start(context.Background(), "selection", testEngine(model, action), testRequest("select context"), agent.OutputPolicy{})
+	if !errors.Is(err, errInjectedBackend) || calls.Load() != 1 {
+		t.Fatalf("start err=%v calls=%d", err, calls.Load())
+	}
+	server.Close() // resumed execution must rely solely on the settled tool result
+	resumedModel := &runtimeProvider{responses: []func(context.Context, provider.Request) (provider.Stream, error){func(ctx context.Context, req provider.Request) (provider.Stream, error) {
+		last := req.Messages[len(req.Messages)-1].ToolResult
+		if last == nil || !strings.Contains(last.Content, `"retainProbability":0.9`) || !strings.Contains(last.Content, `"totalTokens":13`) {
+			t.Fatalf("missing settled scores: %+v", last)
+		}
+		return finalEvents("retained")(ctx, req)
+	}}}
+	second := newTestRuntime(t, store.Reopen(), Options{OwnerID: "second"})
+	result, err := second.Resume(context.Background(), "selection", testEngine(resumedModel, action))
+	if err != nil || result.Failure != nil || result.Text != "retained" || calls.Load() != 1 {
+		t.Fatalf("resume=%+v err=%v calls=%d", result, err, calls.Load())
+	}
+	execution, err := store.LoadExecution(context.Background(), "selection")
+	if err != nil {
+		t.Fatal(err)
+	}
+	encoded, err := json.Marshal(execution)
+	if err != nil || strings.Contains(string(encoded), "caller-secret") {
+		t.Fatalf("checkpoint leaked credential or could not serialize: %v", err)
+	}
+}
+
+func TestRuntime_MalformedFullCallReplaysAsCorrection(t *testing.T) {
+	store := testbackend.New()
+	fault := &failSaveBackend{Backend: store, phase: agent.ContinuationValidatingOutput}
+	first := newTestRuntime(t, fault, Options{OwnerID: "first"})
+	model := &runtimeProvider{responses: []func(context.Context, provider.Request) (provider.Stream, error){providerEvents(
+		provider.Event{Kind: provider.EventToolCallDelta, ToolCallDelta: &provider.ToolCallDelta{ID: "bad", Name: "never", ArgumentsDelta: `{"x"`}},
+		provider.Event{Kind: provider.EventToolCall, ToolCall: &message.ToolCall{ID: "bad", Name: "never", Arguments: json.RawMessage(`:1}`)}},
+		provider.Event{Kind: provider.EventDone, StopReason: provider.StopReasonToolUse},
+	)}}
+	_, err := first.Start(context.Background(), "bad-json", testEngine(model), testRequest("fix"), agent.OutputPolicy{})
+	if !errors.Is(err, errInjectedBackend) {
+		t.Fatalf("start err=%v", err)
+	}
+	resumedModel := &runtimeProvider{responses: []func(context.Context, provider.Request) (provider.Stream, error){func(ctx context.Context, req provider.Request) (provider.Stream, error) {
+		last := req.Messages[len(req.Messages)-1]
+		if last.Role != message.RoleUser || !strings.Contains(last.Text, "valid JSON") {
+			t.Fatalf("missing correction: %+v", last)
+		}
+		return finalEvents("corrected")(ctx, req)
+	}}}
+	second := newTestRuntime(t, store.Reopen(), Options{OwnerID: "second"})
+	result, err := second.Resume(context.Background(), "bad-json", testEngine(resumedModel))
+	if err != nil || result.Failure != nil || result.Text != "corrected" || result.ToolCallsUsed != 0 || resumedModel.callCount() != 1 {
+		t.Fatalf("resume=%+v err=%v", result, err)
+	}
 }

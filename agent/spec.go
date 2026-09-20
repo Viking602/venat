@@ -11,6 +11,7 @@ import (
 	"github.com/Viking602/venat/provider"
 	"github.com/Viking602/venat/skill"
 	"github.com/Viking602/venat/tool"
+	"github.com/Viking602/venat/tool/kit"
 )
 
 // ErrProviderResolverMissing is returned by Build when BuildDeps carries no
@@ -27,8 +28,8 @@ var ErrSkillRegistryMissing = errors.New("agent: build deps missing skill regist
 type Spec struct {
 	// Instructions is the agent's system prompt. When BuildDeps supplies no
 	// ContextManager, Build wires a default one that seeds the loop with
-	// Instructions as the system message and Request.Prompt as the user
-	// message.
+	// Instructions as the system message and Request.Prompt/Content as the
+	// user message.
 	Instructions string
 
 	// Skills names reusable instruction bundles resolved against BuildDeps.Skills
@@ -83,6 +84,10 @@ type BuildDeps struct {
 	// May be nil only when every Spec being built declares no tools.
 	Tools *tool.Bus
 
+	// ContextSelection optionally supplies select_context when named in Spec.Tools.
+	// Nil disables this capability. Credentials remain in live dependencies.
+	ContextSelection *kit.ContextSelectionConfig
+
 	// Skills is the registry Build uses to resolve Spec.Skills. It is required
 	// only when a Spec declares one or more skill names.
 	Skills *skill.Registry
@@ -121,7 +126,18 @@ func Build(spec Spec, deps BuildDeps) (Engine, error) {
 		driver = provider.ModelFallback(driver, fallback, spec.FallbackModel)
 	}
 
-	bus, err := resolveBuildTools(spec.Tools, deps.Tools)
+	registry := deps.Tools
+	if deps.ContextSelection != nil && slices.Contains(spec.Tools, "select_context") {
+		selection, err := kit.ContextSelectionTool("select_context", *deps.ContextSelection)
+		if err != nil {
+			return Engine{}, err
+		}
+		registry = registry.Clone()
+		if err := registry.Register(selection); err != nil {
+			return Engine{}, err
+		}
+	}
+	bus, err := resolveBuildTools(spec.Tools, registry)
 	if err != nil {
 		return Engine{}, err
 	}
@@ -136,6 +152,8 @@ func Build(spec Spec, deps BuildDeps) (Engine, error) {
 	}
 	loopPolicy := spec.LoopPolicy
 	loopPolicy.Budget = cloneBudget(spec.LoopPolicy.Budget)
+	loopPolicy.SessionBudget = cloneSessionBudget(spec.LoopPolicy.SessionBudget)
+	loopPolicy.ModelTimeouts = cloneModelTimeouts(spec.LoopPolicy.ModelTimeouts)
 
 	return Engine{
 		Provider:        driver,
@@ -227,13 +245,13 @@ func (c instructionsContext) Build(_ context.Context, request Request) ([]messag
 	if system == "" {
 		system = "You are a Venat agent."
 	}
-	prompt := strings.TrimSpace(request.Prompt)
-	if prompt == "" {
-		prompt = "Complete the assigned task and return a concise result."
+	input, err := requestMessage(request)
+	if err != nil {
+		return nil, err
 	}
 	return []message.Message{
 		message.NewText(message.RoleSystem, system),
-		message.NewText(message.RoleUser, prompt),
+		input,
 	}, nil
 }
 

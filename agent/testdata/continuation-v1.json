@@ -1,0 +1,1 @@
+{"activeElapsed":0,"messages":[{"content":[{"kind":"text","text":"hi"}],"kind":"standard","response":{},"role":"user","text":"hi"}],"nextOperationTurn":0,"outputPolicy":{},"phase":"ready","repairCount":0,"request":{"prompt":"hi"},"schemaVersion":1,"steps":null,"toolCallsUsed":0,"usage":{}}

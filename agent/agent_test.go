@@ -310,15 +310,15 @@ func TestEngineRunForwardsUnlimitedIterations(t *testing.T) {
 	}
 }
 
-func TestEngineFailsWhenToolCallsExistButToolBusMissing(t *testing.T) {
+func TestEngineReturnsToolFeedbackWhenToolBusMissing(t *testing.T) {
 	engine := Engine{Provider: fakeProvider{}}
-	_, err := engine.RunMessages(context.Background(), LoopInput{
+	out, err := engine.RunMessages(context.Background(), LoopInput{
 		Model:         "test-model",
 		Messages:      []message.Message{message.NewText(message.RoleUser, "find venat")},
 		MaxIterations: 1,
 	})
-	if !errors.Is(err, ErrToolBusMissing) {
-		t.Fatalf("expected ErrToolBusMissing, got %v", err)
+	if err != nil || out.ToolCallsUsed != 1 || out.Messages[len(out.Messages)-1].ToolResult == nil || !out.Messages[len(out.Messages)-1].ToolResult.IsError {
+		t.Fatalf("expected completed rejection, got %+v, %v", out, err)
 	}
 }
 
@@ -614,9 +614,9 @@ func TestCollectMergesFullAndDeltaToolCalls(t *testing.T) {
 	}
 }
 
-func TestCollectRejectsInvalidToolCallJSON(t *testing.T) {
+func TestCollectMarksInvalidToolCallJSONForCorrection(t *testing.T) {
 	engine := Engine{}
-	_, _, _, err := engine.collect(context.Background(), provider.NewSliceStream([]provider.Event{
+	assistant, _, _, err := engine.collect(context.Background(), provider.NewSliceStream([]provider.Event{
 		{
 			Kind: provider.EventToolCallDelta,
 			ToolCallDelta: &provider.ToolCallDelta{
@@ -627,8 +627,8 @@ func TestCollectRejectsInvalidToolCallJSON(t *testing.T) {
 		},
 		{Kind: provider.EventDone, StopReason: provider.StopReasonToolUse},
 	}), nil, nil)
-	if err == nil {
-		t.Fatal("expected invalid tool call JSON error")
+	if err != nil || len(assistant.ToolCalls) != 0 || assistant.Metadata[responseRecoveryKey] != "invalid_tool_arguments" {
+		t.Fatalf("expected correction without raw malformed calls: %+v, %v", assistant, err)
 	}
 }
 

@@ -225,9 +225,7 @@ func TestSkillCompactorDoesNotDuplicatePreservedActivationResult(t *testing.T) {
 		message.NewText(message.RoleAssistant, "activating"),
 		message.NewToolResult(result),
 	}
-	engine := Engine{ContextBuilder: ContextBuilderFunc(func(context.Context, Request) ([]message.Message, error) {
-		return nil, nil
-	})}
+	engine := Engine{ContextBuilder: &recordingContextManager{}}
 	compacted, err := engine.compactor(runtime)(context.Background(), history)
 	if err != nil {
 		t.Fatal(err)

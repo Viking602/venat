@@ -23,6 +23,28 @@ func (e Engine) RunStream(ctx context.Context, request Request, policy OutputPol
 }
 
 func (e Engine) run(ctx context.Context, request Request, policy OutputPolicy, sink Sink) Result {
+	policy = cloneAgentToolOutputPolicy(policy)
+	format, policyErr := prepareOutputPolicy(policy)
+	if policyErr != nil {
+		return Result{Failure: schemaInvalidFailure(policyErr)}
+	}
+	request = cloneRequest(request)
+	if request.SessionBudget == nil {
+		request.SessionBudget = cloneSessionBudget(e.LoopPolicy.SessionBudget)
+	}
+	if request.ModelTimeouts == nil {
+		resolved := e.modelTimeouts(request)
+		request.ModelTimeouts = &resolved
+	}
+	if err := request.Validate(); err != nil {
+		return Result{Failure: (&AgentFailure{Kind: FailureKindContextBuildFailed, Reason: err.Error()}).WithCause(err)}
+	}
+	controlledCtx, finish, controlErr := e.Control.start(ctx)
+	if controlErr != nil {
+		return Result{Failure: loopErrorFailure(ctx, controlErr, false)}
+	}
+	defer finish()
+	ctx = controlledCtx
 	started := time.Now()
 	runCtx, cancelRun, budgetDriven := e.runContext(ctx, request)
 	defer cancelRun()
@@ -63,10 +85,12 @@ func (e Engine) run(ctx context.Context, request Request, policy OutputPolicy, s
 		MaxTokens:           maxTokens,
 		MaxToolCalls:        maxToolCalls,
 		MaxSteps:            maxSteps,
+		ModelTimeouts:       e.modelTimeouts(request),
 		ContextTokenTarget:  e.LoopPolicy.ContextTokenTarget,
 		OperationTurn:       e.OperationTurn,
 		StopSequences:       e.StopSequences,
 		ThinkingBudget:      e.ThinkingBudget,
+		ResponseFormat:      format,
 		ExtraBody:           e.ExtraBody,
 		PromptCacheKey:      e.PromptCacheKey,
 		ServiceTier:         e.ServiceTier,
@@ -75,6 +99,8 @@ func (e Engine) run(ctx context.Context, request Request, policy OutputPolicy, s
 		OutputGuardrails:    e.OutputGuardrails,
 		OutputObserver:      e.OutputObserver,
 		Sink:                sink,
+		Control:             e.Control,
+		controlBound:        true,
 		StepDecider:         e.StepDecider,
 		StepObserver:        e.StepObserver,
 		Compact:             compact,
@@ -147,6 +173,9 @@ func (e Engine) validateAndRepairStructuredOutput(ctx context.Context, input Loo
 		repairInput.OperationTurn = output.NextOperationTurn
 		repairInput.initialUsage = output.Usage
 		repairInput.initialSteps = cloneSteps(output.Steps)
+		if len(repairInput.initialSteps) > 0 {
+			repairInput.initialSteps[len(repairInput.initialSteps)-1].Decision = StepDecisionContinue
+		}
 		repairInput.initialToolCallsUsed = output.ToolCallsUsed
 		repairInput.activeElapsed = output.ActiveElapsed
 		repairInput.segmentStarted = time.Now()
@@ -236,23 +265,49 @@ func (e Engine) runContextWithElapsed(ctx context.Context, request Request, elap
 }
 
 func (e Engine) maxWallClock(request Request) time.Duration {
+	var maxWallClock time.Duration
 	if request.Budget != nil {
-		return request.Budget.MaxWallClock
+		maxWallClock = request.Budget.MaxWallClock
+	} else if e.LoopPolicy.Budget != nil {
+		maxWallClock = e.LoopPolicy.Budget.MaxWallClock
 	}
-	if e.LoopPolicy.Budget != nil {
-		return e.LoopPolicy.Budget.MaxWallClock
+	session := e.sessionBudget(request)
+	if session == nil || session.MaxWallClock <= 0 {
+		return maxWallClock
 	}
-	return 0
+	if maxWallClock <= 0 || session.MaxWallClock < maxWallClock {
+		return session.MaxWallClock
+	}
+	return maxWallClock
 }
 
 func (e Engine) budgetLimits(request Request) (maxTokens int64, maxToolCalls, maxSteps int) {
 	if request.Budget != nil {
-		return request.Budget.MaxTokens, request.Budget.MaxToolCalls, request.Budget.MaxSteps
+		maxTokens, maxToolCalls, maxSteps = request.Budget.MaxTokens, request.Budget.MaxToolCalls, request.Budget.MaxSteps
+	} else if e.LoopPolicy.Budget != nil {
+		maxTokens, maxToolCalls, maxSteps = e.LoopPolicy.Budget.MaxTokens, e.LoopPolicy.Budget.MaxToolCalls, e.LoopPolicy.Budget.MaxSteps
 	}
-	if e.LoopPolicy.Budget != nil {
-		return e.LoopPolicy.Budget.MaxTokens, e.LoopPolicy.Budget.MaxToolCalls, e.LoopPolicy.Budget.MaxSteps
+	if session := e.sessionBudget(request); session != nil && session.MaxTokens > 0 && (maxTokens <= 0 || session.MaxTokens < maxTokens) {
+		maxTokens = session.MaxTokens
 	}
-	return 0, 0, 0
+	return maxTokens, maxToolCalls, maxSteps
+}
+
+func (e Engine) sessionBudget(request Request) *SessionBudget {
+	if request.SessionBudget != nil {
+		return request.SessionBudget
+	}
+	return e.LoopPolicy.SessionBudget
+}
+
+func (e Engine) modelTimeouts(request Request) ModelTimeoutPolicy {
+	if request.ModelTimeouts != nil {
+		return request.ModelTimeouts.resolved()
+	}
+	if e.LoopPolicy.ModelTimeouts != nil {
+		return e.LoopPolicy.ModelTimeouts.resolved()
+	}
+	return (ModelTimeoutPolicy{}).resolved()
 }
 
 // loopErrorFailure preserves factual failure classification and the original
@@ -262,6 +317,10 @@ func loopErrorFailure(ctx context.Context, err error, budgetDriven bool) *AgentF
 	var tripwire *OutputGuardrailTripwireTriggeredError
 	var retryLimit *OutputGuardrailRetryLimitExceededError
 	switch {
+	case errors.Is(err, errIncompleteResponse):
+		failure.Kind = FailureKindRepairFailed
+	case errors.Is(err, errContextLimit):
+		failure.Kind = FailureKindContextBuildFailed
 	case errors.Is(err, ErrBudgetExhausted):
 		failure.Kind = FailureKindBudgetExhausted
 	case budgetDriven && errors.Is(err, context.DeadlineExceeded) && errors.Is(ctx.Err(), context.DeadlineExceeded):
@@ -332,13 +391,12 @@ func removeSkillContextMessages(messages []message.Message) []message.Message {
 	return out
 }
 
-// compactor returns the ContextManager.Compact bound as the loop's compaction
-// hook, or nil when no ContextManager is configured (the loop then never
-// compacts). The default context managers pass the history through unchanged, so
-// wiring this is a no-op until a caller supplies a ContextManager whose Compact
-// actually reshapes the history.
+// compactor binds an explicit history transform. Built-in pass-through builders
+// leave this nil so a positive ContextTokenTarget uses the default provider-view
+// fitter without erasing transcript and checkpoint evidence.
 func (e Engine) compactor(runtime *skillRuntime) func(context.Context, []message.Message) ([]message.Message, error) {
-	if e.ContextBuilder == nil {
+	switch e.ContextBuilder.(type) {
+	case nil, instructionsContext, defaultContextBuilder, ContextBuilderFunc:
 		return nil
 	}
 	return func(ctx context.Context, history []message.Message) ([]message.Message, error) {
@@ -399,13 +457,13 @@ func validateSkillContextPreserved(before, after []message.Message) error {
 type defaultContextBuilder struct{}
 
 func (defaultContextBuilder) Build(_ context.Context, request Request) ([]message.Message, error) {
-	prompt := strings.TrimSpace(request.Prompt)
-	if prompt == "" {
-		prompt = "Complete the assigned task and return a concise result."
+	input, err := requestMessage(request)
+	if err != nil {
+		return nil, err
 	}
 	return []message.Message{
 		message.NewText(message.RoleSystem, "You are a Venat agent."),
-		message.NewText(message.RoleUser, prompt),
+		input,
 	}, nil
 }
 

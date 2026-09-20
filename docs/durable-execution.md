@@ -67,13 +67,45 @@ Request creation and decisions are idempotent in the application store. Replayed
 
 ### Wire version and rollout
 
-`agent.ContinuationSchemaVersion` is currently `1`. `agent.EncodeContinuation` emits every top-level recovery field and canonicalizes the document; `agent.DecodeContinuation` accepts one closed JSON object, rejects unknown or missing known fields, and validates the state before returning it. `durable.HashContinuation` is SHA-256 over those exact codec bytes, and `durable.ValidateCheckpoint` verifies the sequence, continuation, version, and hash together.
+`agent.ContinuationSchemaVersion` is currently `2`. Version 2 adds typed request
+content and the native-output opt-in. The strict decoder accepts versions 1 and
+2, rejects unknown/missing/duplicate fields and future versions, and rejects v2
+fields even when smuggled into a v1 document. There is no v0 translator.
 
-Version `1` is the first supported wire contract. A missing, zero, mistyped, or future `schemaVersion` fails closed. Candidate checkpoints written before this contract have no supported v0 translator; drain them, restart them under new execution IDs, or convert them offline in application-owned storage before rollout.
+Version 1 documents retain their original version and canonical bytes on decode
+and re-encode, so existing SHA-256 checkpoint hashes remain valid. The immutable
+`agent/testdata/continuation-v1.json` fixture covers this guarantee. Resume first
+validates the stored checkpoint and hash, then performs a pure private in-memory
+upgrade. The next safe boundary writes the v2 continuation and matching hash
+atomically through `Backend.SaveCheckpoint`; it never rewrites storage on read.
 
-Do not run a v1 writer beside binaries that do not understand v1. Once the first v1 checkpoint is persisted, rollback is safe only by restoring an application storage backup or by rolling back before that first write.
+This version writes v2 immediately; it has no reader-only deployment mode.
+Pause dispatch, drain or suspend active executions, upgrade every worker, then
+resume dispatch so no v1-only worker can claim newly written v2 checkpoints.
+Older binaries reject v2. Once a v2 checkpoint is written, rollback requires draining
+those executions or restoring an application-owned backup; never downgrade a
+payload or edit its version/hash manually. Subsequent versions must retain closed
+per-version decoding, golden fixtures, explicit conversion, atomic hash updates,
+and a documented rollback path.
 
-A future v2 change must ship an immutable v1 golden fixture, a pure private v1-to-v2 conversion, sequential decode and validation for every version, an atomic continuation-plus-hash rewrite, and explicit rollback instructions. Versions may not be skipped, automatically downgraded, or extended by application-registered migrators.
+Live input receipts succeed only after the runtime's checkpoint observer succeeds.
+The process-local pending queue is not durable. A failed receipt after a response
+loss can coexist with a committed checkpoint; inspect recorded Messages before
+resending. Unknown model/tool effects still require reconciliation. See
+[execution control](agent-execution.md#input-during-execution).
+
+Completed model responses with malformed raw JSON arguments use model-attempt
+envelope v2, storing the original argument text separately from JSON fields.
+Replay restores the exact event kind and text; it must not reinterpret a full
+call as a delta. Ordinary model/tool attempts still use envelope v1; readers
+accept both model envelope versions. Older workers reject v2, so upgrade all
+workers sharing an execution queue before writing these attempts. Continuation
+schema remains v2 and its v1 canonical compatibility is unchanged.
+
+Optional Jev context scores use ordinary tool attempts and require no new backend
+record kind or schema. Settled selections replay without contacting Jev. Their
+API key lives only in runtime dependencies, never in tool arguments, scores or
+continuations. Auxiliary model usage is carried by the structured tool result.
 
 ## Effect attempts
 

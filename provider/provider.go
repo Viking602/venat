@@ -144,6 +144,9 @@ type ResponseFormat struct {
 	Name   string              `json:"name,omitempty"`
 	Strict bool                `json:"strict,omitempty"`
 	Schema *message.JSONSchema `json:"schema,omitempty"`
+	// RawSchema preserves JSON Schema values that Schema cannot represent,
+	// such as numeric enums. When present it takes precedence over Schema.
+	RawSchema json.RawMessage `json:"rawSchema,omitempty"`
 }
 
 type Event struct {

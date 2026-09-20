@@ -66,6 +66,8 @@ type LoopInput struct {
 	// Sink receives transient provider and tool-result frames as the loop runs.
 	// Its errors abort the current turn.
 	Sink Sink
+	// Control optionally accepts user input at safe model boundaries.
+	Control *Control
 
 	StopSequences  []string
 	ThinkingBudget int
@@ -91,12 +93,18 @@ type LoopInput struct {
 	MaxTokens    int64
 	MaxToolCalls int
 	MaxSteps     int
+	// ModelTimeouts bounds provider connection, total-request, and stream-idle
+	// phases for each model turn. Zero values use Codex-compatible defaults.
+	ModelTimeouts ModelTimeoutPolicy
 
 	// ContextTokenTarget is the usable token allowance for message history in
 	// one provider request, after the caller reserves room for output, tools,
 	// schemas, reasoning, and provider framing. It is independent of MaxTokens,
 	// which remains the cumulative run-spend ceiling. When positive, the loop
 	// prepares context before every model turn, including the first.
+	// Without custom compactors it bounds the provider view using a conservative
+	// text estimate while preserving the full execution transcript. Media needs
+	// a caller-supplied model-aware CompactTo.
 	ContextTokenTarget int
 
 	// StepDecider may override the natural decision at continue boundaries.
@@ -134,6 +142,7 @@ type LoopInput struct {
 
 	continuationRequest  Request
 	continuationPolicy   OutputPolicy
+	controlBound         bool
 	repairCount          int
 	activeElapsed        time.Duration
 	segmentStarted       time.Time
@@ -219,11 +228,22 @@ type Engine struct {
 	StepObserver StepObserver
 	// Boundaries observes safe continuation points before the next effect.
 	Boundaries BoundaryObserver
+	// Control is single-use and must not be shared between concurrent runs.
+	Control *Control
 }
 
 // RunMessages is the low-level loop that drives one LoopInput to
 // completion. Engine.Run is the execution-level wrapper most callers want.
 func (e Engine) RunMessages(ctx context.Context, input LoopInput) (out LoopOutput, err error) {
+	if !input.controlBound {
+		var finish func()
+		ctx, finish, err = input.Control.start(ctx)
+		if err != nil {
+			return LoopOutput{}, err
+		}
+		defer finish()
+		input.controlBound = true
+	}
 	if input.segmentStarted.IsZero() {
 		input.segmentStarted = time.Now()
 	}
@@ -280,6 +300,8 @@ func (e Engine) RunMessages(ctx context.Context, input LoopInput) (out LoopOutpu
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return loopErrorOutput(current, totalUsage, steps, iteration, toolCallsUsed), ctxErr
 		}
+		pendingInput := input.Control.take()
+		current = append(current, message.CloneMessages(pendingInput)...)
 		// Enforce the per-loop budget before every turn after the first.
 		// Reaching iteration N>0 means a prior turn chose to continue, so this
 		// is exactly a "will continue" boundary; a run that finished earlier
@@ -297,7 +319,13 @@ func (e Engine) RunMessages(ctx context.Context, input LoopInput) (out LoopOutpu
 			}
 			current = prepared
 		}
-		if boundaryErr := e.observeBoundary(ctx, input, current, totalUsage, steps, toolCallsUsed, ContinuationReady); boundaryErr != nil {
+		if inputErr := validatePendingInput(current, pendingInput); inputErr != nil {
+			input.Control.acknowledge(inputErr)
+			return loopErrorOutput(current, totalUsage, steps, iteration, toolCallsUsed), inputErr
+		}
+		boundaryErr := e.observeBoundary(ctx, input, current, totalUsage, steps, toolCallsUsed, ContinuationReady)
+		input.Control.acknowledge(boundaryErr)
+		if boundaryErr != nil {
 			return loopErrorOutput(current, totalUsage, steps, iteration, toolCallsUsed), boundaryErr
 		}
 		assistant, usage, stopReason, identity, opened, turnErr := e.runTurn(ctx, current, input)
@@ -349,6 +377,9 @@ func (e Engine) RunMessages(ctx context.Context, input LoopInput) (out LoopOutpu
 		if stop {
 			return out, err
 		}
+	}
+	if len(steps) > 0 && responseRecoveryCount(steps[len(steps)-1:]) > 0 {
+		return loopErrorOutput(current, totalUsage, steps, len(steps), toolCallsUsed), errIncompleteResponse
 	}
 	return LoopOutput{
 		Messages:      current,
@@ -520,6 +551,15 @@ func (e Engine) runToolStep(
 	if executionErr := errors.Join(dispatchErr, appendErr); executionErr != nil {
 		return loopErrorOutput(*current, *totalUsage, *steps, iteration+1, *toolCallsUsed), true, executionErr
 	}
+	if terminal {
+		terminal = false
+		for index, result := range results {
+			if !result.IsError && e.Tools.IsTerminal(prepared[index].Name) {
+				terminal = true
+				break
+			}
+		}
+	}
 	nextSteps, out, stop, err := e.finalizeToolStep(
 		ctx, *input, *current, *totalUsage, *steps, assistant,
 		results, terminal, iteration, *toolCallsUsed,
@@ -591,8 +631,30 @@ func (e Engine) finalizeNoToolStep(
 		}
 		return current, steps, LoopOutput{}, true, nil
 	}
+	correction, recoveryErr := responseRecovery(steps, finalOutput)
+	if recoveryErr != nil {
+		steps[len(steps)-1].Decision = StepDecisionFail
+		recoveryErr = errors.Join(recoveryErr, observeFinalizedStep(ctx, input.StepObserver, steps))
+		return current, steps, loopErrorOutput(current, totalUsage, steps, iteration+1, toolCallsUsed), false, recoveryErr
+	}
+	if correction.Role != "" {
+		steps[len(steps)-1].Decision = StepDecisionContinue
+		steps[len(steps)-1].Observations = append(steps[len(steps)-1].Observations, Observation{Kind: "response_recovery", Message: finalOutput.Metadata[responseRecoveryKey]})
+		current = append(appendFinalAssistant(base, finalOutput), correction)
+		if observeErr := observeFinalizedStep(ctx, input.StepObserver, steps); observeErr != nil {
+			return current, steps, loopErrorOutput(current, totalUsage, steps, iteration+1, toolCallsUsed), false, observeErr
+		}
+		return current, steps, LoopOutput{}, true, nil
+	}
 
 	current = appendFinalAssistant(base, finalOutput)
+	if input.Control.continueOrSeal() {
+		steps[len(steps)-1].Decision = StepDecisionContinue
+		if observeErr := observeFinalizedStep(ctx, input.StepObserver, steps); observeErr != nil {
+			return current, steps, loopErrorOutput(current, totalUsage, steps, iteration+1, toolCallsUsed), false, observeErr
+		}
+		return current, steps, LoopOutput{}, true, nil
+	}
 	if observeErr := observeFinalizedStep(ctx, input.StepObserver, steps); observeErr != nil {
 		return current, steps, loopErrorOutput(current, totalUsage, steps, iteration+1, toolCallsUsed), false, observeErr
 	}
@@ -1178,6 +1240,7 @@ func cloneResponseFormat(value *provider.ResponseFormat) *provider.ResponseForma
 		schema := cloneJSONSchema(*value.Schema)
 		cloned.Schema = &schema
 	}
+	cloned.RawSchema = append(json.RawMessage(nil), value.RawSchema...)
 	return &cloned
 }
 
@@ -1211,26 +1274,45 @@ func (e Engine) runTurn(ctx context.Context, current []message.Message, input Lo
 	if err := e.Hooks.BeforeModelCall(ctx, &request); err != nil {
 		return message.Message{}, provider.Usage{}, provider.StopReasonError, provider.StreamIdentity{}, false, err
 	}
+	if input.ContextTokenTarget > 0 && input.Compact == nil && input.CompactTo == nil {
+		request.Messages, err = fitContext(ctx, request.Messages, input.ContextTokenTarget)
+		if err != nil {
+			return message.Message{}, provider.Usage{}, provider.StopReasonError, provider.StreamIdentity{}, false, err
+		}
+	}
 	request.OperationID = fmt.Sprintf("turn:%d:model", input.OperationTurn)
 	if err := provider.ValidateExtraBody(request.ExtraBody); err != nil {
 		return message.Message{}, provider.Usage{}, provider.StopReasonError, provider.StreamIdentity{}, false, err
 	}
-	var providerStream provider.Stream
-	if interceptor := provider.ChainStreamInterceptors(e.ModelInterceptor); interceptor != nil {
-		providerStream, err = interceptor.Stream(ctx, e.Provider, request)
-	} else {
-		providerStream, err = e.Provider.Stream(ctx, request)
-	}
+	modelTimeouts := input.ModelTimeouts.resolved()
+	modelCtx, cancelModel := modelRequestContext(ctx, modelTimeouts)
+	defer cancelModel()
+	providerStream, err := openModelStream(modelCtx, modelTimeouts.ConnectTimeout, cancelModel, func(openCtx context.Context) (provider.Stream, error) {
+		if interceptor := provider.ChainStreamInterceptors(e.ModelInterceptor); interceptor != nil {
+			return interceptor.Stream(openCtx, e.Provider, request)
+		}
+		return e.Provider.Stream(openCtx, request)
+	})
 	if err != nil {
+		if errors.Is(context.Cause(modelCtx), provider.ErrModelRequestTimeout) {
+			err = errors.Join(provider.ErrModelRequestTimeout, context.DeadlineExceeded, err)
+		}
 		return message.Message{}, provider.Usage{}, provider.StopReasonError, provider.StreamIdentity{}, false, err
 	}
-	assistant, usage, stop, collectErr := e.collect(ctx, providerStream, input.OnEvent, input.Sink)
+	providerStream = provider.WithStreamIdleTimeout(modelCtx, providerStream, modelTimeouts.StreamIdleTimeout)
+	assistant, usage, stop, collectErr := e.collect(modelCtx, providerStream, input.OnEvent, input.Sink)
+	if collectErr != nil && errors.Is(modelCtx.Err(), context.DeadlineExceeded) && errors.Is(context.Cause(modelCtx), provider.ErrModelRequestTimeout) {
+		collectErr = errors.Join(provider.ErrModelRequestTimeout, context.DeadlineExceeded, collectErr)
+	}
 	identity := provider.StreamIdentity{
 		Provider: e.Provider.Metadata(),
 		Model:    request.Model,
 	}
 	if identified, ok := providerStream.(provider.IdentifiedStream); ok {
 		identity = identified.Identity()
+		if identity.Provider.Name == "" {
+			identity.Provider = e.Provider.Metadata()
+		}
 		if identity.Model == "" {
 			identity.Model = request.Model
 		}
@@ -1238,20 +1320,56 @@ func (e Engine) runTurn(ctx context.Context, current []message.Message, input Lo
 	return assistant, usage, stop, identity, true, collectErr
 }
 
-// prepareToolCalls runs each call's BeforeToolCall hook — which may rewrite the
-// tool name — and verifies the resulting name is registered, returning the
-// prepared calls the bus will dispatch and whether any targets a terminal tool.
-// A nil bus yields ErrToolBusMissing and an unregistered prepared call yields
-// ErrToolNotFound; both are FailureKindToolUnavailable. Availability is judged on
-// the hook-mutated calls, not the raw model-emitted ones, because the hook is the
-// documented place to map a model alias or hallucinated name onto a real tool —
-// checking the raw name would reject one a hook was about to fix. None of these
-// paths dispatches a driver, so the loop returns before charging them.
-
-func (e Engine) prepareToolCalls(ctx context.Context, calls []message.ToolCall) ([]tool.Call, bool, error) {
-	if e.Tools == nil {
-		return nil, false, ErrToolBusMissing
+func modelRequestContext(ctx context.Context, policy ModelTimeoutPolicy) (context.Context, context.CancelFunc) {
+	if policy.RequestTimeout <= 0 {
+		return context.WithCancel(ctx)
 	}
+	return context.WithTimeoutCause(ctx, policy.RequestTimeout, provider.ErrModelRequestTimeout)
+}
+
+func openModelStream(ctx context.Context, timeout time.Duration, cancelModel context.CancelFunc, open func(context.Context) (provider.Stream, error)) (provider.Stream, error) {
+	if timeout <= 0 {
+		return open(ctx)
+	}
+	timeoutCtx, cancelTimeout := context.WithTimeoutCause(ctx, timeout, provider.ErrModelConnectTimeout)
+	defer cancelTimeout()
+	type result struct {
+		stream provider.Stream
+		err    error
+	}
+	results := make(chan result, 1)
+	go func() {
+		defer func() {
+			if recovered := recover(); recovered != nil {
+				results <- result{err: fmt.Errorf("%w: provider stream panic: %v", ErrPanicRecovered, recovered)}
+			}
+		}()
+		stream, err := open(ctx)
+		results <- result{stream: stream, err: err}
+	}()
+	select {
+	case opened := <-results:
+		return opened.stream, opened.err
+	case <-timeoutCtx.Done():
+		if cause := context.Cause(timeoutCtx); !errors.Is(cause, provider.ErrModelConnectTimeout) {
+			return nil, cause
+		}
+		cancelModel()
+		go func() {
+			opened := <-results
+			if opened.stream != nil {
+				_ = opened.stream.Close()
+			}
+		}()
+		return nil, errors.Join(provider.ErrModelConnectTimeout, context.DeadlineExceeded)
+	}
+}
+
+// prepareToolCalls runs each call's BeforeToolCall hook — which may rewrite the
+// tool name — and records whether a prepared call targets a terminal tool.
+// Unavailable names reach the Bus as rejected results the model can correct.
+// Hook failures remain fatal; no driver runs before all hooks succeed.
+func (e Engine) prepareToolCalls(ctx context.Context, calls []message.ToolCall) ([]tool.Call, bool, error) {
 	prepared := make([]tool.Call, 0, len(calls))
 	terminal := false
 	for _, call := range calls {
@@ -1262,11 +1380,7 @@ func (e Engine) prepareToolCalls(ctx context.Context, calls []message.ToolCall) 
 			return nil, false, err
 		}
 		item.OperationID = operationID
-		driver, ok := e.Tools.Driver(item.Name)
-		if !ok {
-			return nil, false, fmt.Errorf("%w: %s", tool.ErrToolNotFound, item.Name)
-		}
-		if driver.Definition().Terminal {
+		if e.Tools != nil && e.Tools.IsTerminal(item.Name) {
 			terminal = true
 		}
 		prepared = append(prepared, item)
@@ -1276,13 +1390,11 @@ func (e Engine) prepareToolCalls(ctx context.Context, calls []message.ToolCall) 
 
 // dispatchPreparedTools executes the hook-prepared calls on the bus, bridges
 // real-time tool updates to the loop sink, and runs AfterToolCall on each final
-// result. prepareToolCalls already validated every call as registered, so a
-// dispatch error comes from a driver that actually ran (or, for a sequential
-// driver, a panic that unwinds inline to the RunMessages recover) — which is why
-// the loop charges the batch before calling this.
+// result. Rejected names/arguments are completed error results and count toward
+// the call budget, so repeated invalid calls cannot bypass execution limits.
 //
-// Every result ExecuteBatch returns ran to completion and side-effected, even
-// when the batch reports an error: a later sequential call failing still yields
+// Every result ExecuteBatch returns is complete, including pre-execution
+// rejection and successful effects. A later sequential call failing still yields
 // the earlier successes, and a parallel call erroring or panicking still yields
 // the completed slots. Those results are post-processed and returned alongside
 // the batch error so the caller records them, sparing a resuming caller from
@@ -1303,7 +1415,11 @@ func (e Engine) dispatchPreparedTools(ctx context.Context, prepared []tool.Call,
 			return sink.Emit(ctx, FrameFromToolUpdate(update))
 		}
 	}
-	results, batchErr := e.Tools.ExecuteBatch(ctx, prepared, mode, tool.ExecuteOptions{
+	bus := e.Tools
+	if bus == nil {
+		bus = tool.NewBus()
+	}
+	results, batchErr := bus.ExecuteBatch(ctx, prepared, mode, tool.ExecuteOptions{
 		Sink:        updates,
 		Interceptor: e.ToolInterceptor,
 	})
@@ -1509,7 +1625,7 @@ func applyNormalized(assistant *message.Message, events []provider.Event, requir
 	} else {
 		normalized, err = provider.NormalizePartialEvents(events)
 	}
-	if err != nil {
+	if err != nil && !(requireTerminal && errors.Is(err, provider.ErrInvalidToolCallArguments)) {
 		return provider.Usage{}, provider.StopReasonError, err
 	}
 	assistant.Content = message.CloneContent(normalized.Content)
@@ -1517,5 +1633,8 @@ func applyNormalized(assistant *message.Message, events []provider.Event, requir
 	assistant.ProviderState = normalized.ProviderState
 	assistant.Response = message.CloneResponseMetadata(normalized.Response)
 	assistant.SyncLegacyContent()
+	if requireTerminal {
+		markIncompleteResponse(assistant, normalized.StopReason, err)
+	}
 	return normalized.Usage, normalized.StopReason, nil
 }

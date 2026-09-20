@@ -58,6 +58,12 @@ Sink calls apply synchronous backpressure. Errors abort the current execution pa
 
 Context managers prepare message history before model calls. A deterministic manager keeps uninterrupted and resumed execution equivalent. External model calls or writes inside context preparation require application-owned idempotency because the durable effect ledger covers only provider and tool boundaries.
 
+With the built-in context builders and a positive `ContextTokenTarget`, the
+Agent fits only the provider-facing view and retains the full transcript.
+Custom managers retain their existing `Compact`/`CompactTo` behavior; they must
+preserve pending user input, complete exchanges, and skill/cache context. Use a
+model-aware `CompactTo` for media. See [Agent execution](agent-execution.md).
+
 ## Schedulers and executors
 
 `orchestration.Scheduler` is the extension point for application routing policy. It receives a cloned state and returns opaque dispatches. `orchestration.Executor` maps each route to concrete execution.

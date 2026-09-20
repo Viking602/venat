@@ -95,6 +95,36 @@ func TestEngineOutputPolicyNumericEnumAcceptsEquivalentJSONNumbers(t *testing.T)
 	}
 }
 
+func TestOutputPolicy_NativeSchemaSurvivesRepairAndResume(t *testing.T) {
+	schema := json.RawMessage(`{"type":"object","properties":{"score":{"type":"integer","enum":[1,2]}},"required":["score"]}`)
+	driver, engine := newOutputPolicyEngine(`{"score":3}`, `{"score":2}`)
+	var ready Continuation
+	engine.Boundaries = BoundaryObserverFunc(func(_ context.Context, value Continuation) error {
+		if ready.SchemaVersion == 0 && value.Phase == ContinuationReady {
+			ready = value
+		}
+		return nil
+	})
+	result := engine.Run(context.Background(), Request{Prompt: "score"}, OutputPolicy{Schema: schema, Native: true, Validate: true, Repair: true, MaxRepairAttempts: 1})
+	if result.Failure != nil || result.RepairCount != 1 || len(driver.requests) != 2 {
+		t.Fatalf("result=%+v calls=%d", result, len(driver.requests))
+	}
+	for _, request := range driver.requests {
+		if request.ResponseFormat == nil || string(request.ResponseFormat.RawSchema) != string(schema) {
+			t.Fatalf("schema not forwarded: %+v", request.ResponseFormat)
+		}
+	}
+	driver, engine = newOutputPolicyEngine(`{"score":1}`)
+	result = engine.Resume(context.Background(), ready)
+	if result.Failure != nil || len(driver.requests) != 1 || string(driver.requests[0].ResponseFormat.RawSchema) != string(schema) {
+		t.Fatalf("resume=%+v requests=%+v", result, driver.requests)
+	}
+	driver.requests[0].ResponseFormat.RawSchema[0] = '['
+	if schema[0] != '{' || ready.OutputPolicy.Schema[0] != '{' {
+		t.Fatal("provider received retained schema storage")
+	}
+}
+
 func TestEngineOutputPolicyAdditionalPropertiesFailWhenDisallowed(t *testing.T) {
 	_, engine := newOutputPolicyEngine(`{"status":"ok","score":0.75,"count":2,"tags":["risk"],"accepted":true,"extra":true}`)
 
@@ -185,8 +215,8 @@ func TestEngineOutputPolicyUnsupportedSchemaKeywordsFailBeforeRepair(t *testing.
 			if result.RepairCount != 0 {
 				t.Fatalf("RepairCount = %d, want 0", result.RepairCount)
 			}
-			if len(driver.requests) != 1 {
-				t.Fatalf("provider calls = %d, want exactly one initial call", len(driver.requests))
+			if len(driver.requests) != 0 {
+				t.Fatalf("provider calls = %d, want zero calls for an invalid schema", len(driver.requests))
 			}
 		})
 	}
@@ -229,8 +259,8 @@ func TestEngineOutputPolicyNestedNullSchemaFailsBeforeRepair(t *testing.T) {
 			if result.RepairCount != 0 {
 				t.Fatalf("RepairCount = %d, want 0", result.RepairCount)
 			}
-			if len(driver.requests) != 1 {
-				t.Fatalf("provider calls = %d, want exactly one initial call", len(driver.requests))
+			if len(driver.requests) != 0 {
+				t.Fatalf("provider calls = %d, want zero calls for an invalid schema", len(driver.requests))
 			}
 		})
 	}

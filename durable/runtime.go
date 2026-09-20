@@ -583,13 +583,13 @@ func (runtime *Runtime) rejectInvalidClaim(active *activeExecution, execution Ex
 }
 
 func validateExecutionSpec(spec ExecutionSpec) error {
-	if spec.Request.Budget != nil {
-		budget := spec.Request.Budget
-		if budget.MaxTokens < 0 || budget.MaxToolCalls < 0 || budget.MaxSteps < 0 || budget.MaxWallClock < 0 {
-			return ErrInvalidArgument
-		}
+	if err := spec.Request.Validate(); err != nil {
+		return fmt.Errorf("%w: %w", ErrInvalidArgument, err)
 	}
-	if spec.OutputPolicy.MaxRepairAttempts < 0 || (len(spec.OutputPolicy.Schema) > 0 && !json.Valid(spec.OutputPolicy.Schema)) {
+	if err := agent.ValidateOutputPolicy(spec.OutputPolicy); err != nil {
+		return fmt.Errorf("%w: %w", ErrInvalidArgument, err)
+	}
+	if len(spec.OutputPolicy.Schema) > 0 && !json.Valid(spec.OutputPolicy.Schema) {
 		return ErrInvalidArgument
 	}
 	return nil

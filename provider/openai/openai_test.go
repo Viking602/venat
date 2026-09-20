@@ -6,6 +6,8 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/Viking602/venat/message"
@@ -29,6 +31,49 @@ func TestNewDefaultClientHasNoStreamLifetimeTimeout(t *testing.T) {
 	driver = New(Config{Client: supplied})
 	if driver.config.Client != supplied {
 		t.Fatal("expected supplied client to be preserved")
+	}
+}
+
+func TestDriver_RawOutputSchemaReachesBothHTTPProtocols(t *testing.T) {
+	for _, api := range []WireAPI{WireChatCompletions, WireResponses} {
+		t.Run(string(api), func(t *testing.T) {
+			var captured map[string]json.RawMessage
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if err := json.NewDecoder(r.Body).Decode(&captured); err != nil {
+					t.Error(err)
+				}
+				w.Header().Set("Content-Type", "text/event-stream")
+				_, _ = w.Write([]byte("data: [DONE]\n\n"))
+			}))
+			defer server.Close()
+			schema := json.RawMessage(`{"type":"object","properties":{"n":{"type":"integer","enum":[1,9007199254740993]}}}`)
+			driver := New(Config{APIKey: "test-key", BaseURL: server.URL, WireAPI: api})
+			stream, err := driver.Stream(context.Background(), provider.Request{
+				Model: "test", Messages: []message.Message{message.NewText(message.RoleUser, "score")},
+				ResponseFormat: &provider.ResponseFormat{Type: "json_schema", Name: "score", RawSchema: schema, Schema: &message.JSONSchema{Type: "string"}},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = stream.Close() }()
+			var outer, format map[string]json.RawMessage
+			if api == WireChatCompletions {
+				_ = json.Unmarshal(captured["response_format"], &outer)
+				_ = json.Unmarshal(outer["json_schema"], &format)
+			} else {
+				_ = json.Unmarshal(captured["text"], &outer)
+				_ = json.Unmarshal(outer["format"], &format)
+			}
+			var gotSchema, wantSchema map[string]any
+			_ = json.Unmarshal(format["schema"], &gotSchema)
+			_ = json.Unmarshal(schema, &wantSchema)
+			if !reflect.DeepEqual(gotSchema, wantSchema) {
+				t.Fatalf("wire schema=%s, want %s", format["schema"], schema)
+			}
+			if !strings.Contains(string(format["schema"]), "9007199254740993") {
+				t.Fatal("large integer enum lost precision")
+			}
+		})
 	}
 }
 

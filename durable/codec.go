@@ -19,8 +19,9 @@ type modelAttemptEnvelope struct {
 }
 
 type storedProviderEvent struct {
-	Event   provider.Event `json:"event"`
-	Failure *FailureRecord `json:"failure,omitempty"`
+	Event            provider.Event `json:"event"`
+	Failure          *FailureRecord `json:"failure,omitempty"`
+	InvalidArguments *string        `json:"invalidArguments,omitempty"`
 }
 
 type toolAttemptEnvelope struct {
@@ -56,11 +57,20 @@ func cloneProviderEvent(event provider.Event) provider.Event {
 
 func encodeModelAttempt(events []provider.Event, failure *FailureRecord) ([]byte, error) {
 	stored := make([]storedProviderEvent, len(events))
+	version := attemptEnvelopeVersion
 	for index, event := range events {
-		stored[index] = storedProviderEvent{Event: event, Failure: failureFromError(event.Err)}
+		stored[index] = storedProviderEvent{Event: cloneProviderEvent(event), Failure: failureFromError(event.Err)}
 		stored[index].Event.Err = nil
+		if event.ToolCall != nil && len(event.ToolCall.Arguments) > 0 && !json.Valid(event.ToolCall.Arguments) {
+			// Preserve the exact event kind and raw text. Converting a full call to
+			// a delta could join earlier fragments into an executable call on replay.
+			arguments := string(event.ToolCall.Arguments)
+			stored[index].InvalidArguments = &arguments
+			stored[index].Event.ToolCall.Arguments = nil
+			version = 2 // old workers fail closed rather than replay empty arguments
+		}
 	}
-	encoded, err := json.Marshal(modelAttemptEnvelope{Version: attemptEnvelopeVersion, Events: stored, Failure: cloneFailureRecord(failure)})
+	encoded, err := json.Marshal(modelAttemptEnvelope{Version: version, Events: stored, Failure: cloneFailureRecord(failure)})
 	if err != nil {
 		return nil, fmt.Errorf("encode model attempt: %w", err)
 	}
@@ -72,12 +82,18 @@ func decodeModelAttempt(payload []byte) ([]provider.Event, *FailureRecord, error
 	if err := json.Unmarshal(payload, &envelope); err != nil {
 		return nil, nil, fmt.Errorf("decode model attempt: %w", err)
 	}
-	if envelope.Version != attemptEnvelopeVersion {
+	if envelope.Version != attemptEnvelopeVersion && envelope.Version != 2 {
 		return nil, nil, fmt.Errorf("unsupported model attempt envelope version %d", envelope.Version)
 	}
 	events := make([]provider.Event, len(envelope.Events))
 	for index, stored := range envelope.Events {
 		events[index] = stored.Event
+		if stored.InvalidArguments != nil {
+			if envelope.Version != 2 || stored.Event.Kind != provider.EventToolCall || stored.Event.ToolCall == nil || len(stored.Event.ToolCall.Arguments) != 0 || *stored.InvalidArguments == "" || json.Valid([]byte(*stored.InvalidArguments)) {
+				return nil, nil, errors.New("invalid stored tool arguments envelope")
+			}
+			events[index].ToolCall.Arguments = []byte(*stored.InvalidArguments)
+		}
 		if stored.Failure != nil {
 			events[index].Err = recordedFailureError(*stored.Failure)
 		}
@@ -163,6 +179,9 @@ func validateSuccessfulModelEvents(events []provider.Event) error {
 		return fmt.Errorf("successful model reconciliation requires a final done event")
 	}
 	_, err := provider.NormalizeEvents(events)
+	if errors.Is(err, provider.ErrInvalidToolCallArguments) {
+		return nil // a completed, rejected model turn is safe to replay for correction
+	}
 	return err
 }
 
