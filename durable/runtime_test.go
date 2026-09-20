@@ -687,9 +687,16 @@ func TestRuntime_DurableInterceptorsAreOutermostAndBoundaryIsLast(t *testing.T) 
 	}
 }
 
-type contextBlockingStream struct{ ctx context.Context }
+type contextBlockingStream struct {
+	ctx         context.Context
+	started     chan<- struct{}
+	startedOnce *sync.Once
+}
 
 func (stream contextBlockingStream) Recv() (provider.Event, error) {
+	if stream.started != nil && stream.startedOnce != nil {
+		stream.startedOnce.Do(func() { close(stream.started) })
+	}
 	<-stream.ctx.Done()
 	return provider.Event{}, context.Cause(stream.ctx)
 }
@@ -698,8 +705,7 @@ func (contextBlockingStream) Close() error { return nil }
 
 func blockingProvider(started chan<- struct{}) *runtimeProvider {
 	return &runtimeProvider{responses: []func(context.Context, provider.Request) (provider.Stream, error){func(ctx context.Context, _ provider.Request) (provider.Stream, error) {
-		close(started)
-		return contextBlockingStream{ctx: ctx}, nil
+		return contextBlockingStream{ctx: ctx, started: started, startedOnce: &sync.Once{}}, nil
 	}}}
 }
 
