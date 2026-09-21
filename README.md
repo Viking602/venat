@@ -10,7 +10,7 @@ For command-error correction, typed input, native JSON output, context fitting,
 and live user input, see [Agent execution](docs/agent-execution.md) and run
 `go run ./examples/interactive` for a credential-free local smoke scenario.
 
-> **Status:** The latest published release is [v0.16.1](https://github.com/Viking602/venat/releases/tag/v0.16.1). Public APIs may change before v1.0.
+> **Status:** The latest published release is [v0.17.0](https://github.com/Viking602/venat/releases/tag/v0.17.0). Public APIs may change before v1.0.
 
 ## Packages
 
