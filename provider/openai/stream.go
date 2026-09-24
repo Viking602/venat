@@ -30,6 +30,7 @@ type chatCompletionRequest struct {
 	Stop              []string          `json:"stop,omitempty"`
 	Reasoning         *reasoningOptions `json:"reasoning,omitempty"`
 	ResponseFormat    any               `json:"response_format,omitempty"`
+	Metadata          map[string]string `json:"metadata,omitempty"`
 	PromptCacheKey    string            `json:"prompt_cache_key,omitempty"`
 	ServiceTier       string            `json:"service_tier,omitempty"`
 	ParallelToolCalls *bool             `json:"parallel_tool_calls,omitempty"`
@@ -107,9 +108,9 @@ type chunk struct {
 	Choices []choiceChunk      `json:"choices"`
 	Error   *responsesAPIError `json:"error,omitempty"`
 	Usage   struct {
-		PromptTokens        int `json:"prompt_tokens"`
-		CompletionTokens    int `json:"completion_tokens"`
-		TotalTokens         int `json:"total_tokens"`
+		PromptTokens        *int `json:"prompt_tokens"`
+		CompletionTokens    int  `json:"completion_tokens"`
+		TotalTokens         int  `json:"total_tokens"`
 		PromptTokensDetails struct {
 			CachedTokens     *int `json:"cached_tokens"`
 			CacheWriteTokens *int `json:"cache_write_tokens"`
@@ -140,13 +141,15 @@ type toolCallDeltaItem struct {
 }
 
 type streamState struct {
-	reader     *shared.Reader
-	pending    []provider.Event
-	finished   bool
-	usage      provider.Usage
-	stopReason provider.StopReason
-	response   provider.ResponseMetadata
-	splitter   thinkSplitter
+	reader               *shared.Reader
+	pending              []provider.Event
+	finished             bool
+	usage                provider.Usage
+	stopReason           provider.StopReason
+	response             provider.ResponseMetadata
+	splitter             thinkSplitter
+	contextUsage         provider.ContextUsageObserver
+	contextUsageReported bool
 }
 
 // thinkSplitter extracts <think>...</think> segments from a streamed token
@@ -226,14 +229,12 @@ func safeEmitLen(s, target string) int {
 }
 
 func (d Driver) streamChatCompletions(ctx context.Context, request provider.Request) (provider.Stream, error) {
+	responseFormat := responseFormatFromRequest(request.ResponseFormat)
 	apiKey, err := d.apiKey()
 	if err != nil {
 		return nil, err
 	}
-	messages, err := toChatMessages(request.Messages)
-	if err != nil {
-		return nil, err
-	}
+	messages := toChatMessages(request.Messages)
 	body, err := marshalChatCompletionRequest(chatCompletionRequest{
 		Model:             request.Model,
 		Messages:          messages,
@@ -245,7 +246,8 @@ func (d Driver) streamChatCompletions(ctx context.Context, request provider.Requ
 		StreamOptions:     streamOptions{IncludeUsage: true},
 		Stop:              request.StopSequences,
 		Reasoning:         reasoningFromBudget(request.ThinkingBudget),
-		ResponseFormat:    responseFormatFromRequest(request.ResponseFormat),
+		ResponseFormat:    responseFormat,
+		Metadata:          request.Metadata,
 		PromptCacheKey:    request.PromptCacheKey,
 		ServiceTier:       request.ServiceTier,
 		ParallelToolCalls: request.ParallelToolCalls,
@@ -258,8 +260,11 @@ func (d Driver) streamChatCompletions(ctx context.Context, request provider.Requ
 		return nil, err
 	}
 	return &openAIStream{
-		body:  bodyStream,
-		state: streamState{reader: shared.NewReader(bodyStream)},
+		body: bodyStream,
+		state: streamState{
+			reader:       shared.NewReader(bodyStream),
+			contextUsage: request.ContextUsage,
+		},
 	}, nil
 }
 
@@ -356,6 +361,7 @@ var managedChatCompletionBodyFields = map[string]struct{}{
 	"stop":                {},
 	"reasoning":           {},
 	"response_format":     {},
+	"metadata":            {},
 	"prompt_cache_key":    {},
 	"service_tier":        {},
 	"parallel_tool_calls": {},
@@ -368,13 +374,19 @@ var protectedChatModelFields = map[string]struct{}{
 }
 
 func responseFormatFromRequest(format *provider.ResponseFormat) any {
-	if format == nil || format.Type == "" {
+	if format == nil {
 		return nil
 	}
 	switch format.Type {
+	case "text":
+		return map[string]any{"type": "text"}
 	case "json_object":
 		return map[string]any{"type": "json_object"}
 	case "json_schema":
+		if len(format.RawSchema) == 0 && format.Schema == nil {
+			shared.WarnDrop("openai chat completions", "responseFormat", "response format json_schema requires schema")
+			return nil
+		}
 		payload := map[string]any{
 			"type": "json_schema",
 			"json_schema": map[string]any{
@@ -384,11 +396,13 @@ func responseFormatFromRequest(format *provider.ResponseFormat) any {
 		}
 		if len(format.RawSchema) > 0 {
 			payload["json_schema"].(map[string]any)["schema"] = format.RawSchema
-		} else if format.Schema != nil {
+		} else {
 			payload["json_schema"].(map[string]any)["schema"] = format.Schema
 		}
 		return payload
 	default:
+		shared.WarnDrop("openai chat completions", "responseFormat",
+			fmt.Sprintf("unsupported response format type %q", format.Type))
 		return nil
 	}
 }
@@ -414,6 +428,9 @@ func (s *openAIStream) Recv() (provider.Event, error) {
 		}
 		current, err := s.state.reader.Next()
 		if err != nil {
+			if err == io.EOF {
+				return provider.Event{}, io.ErrUnexpectedEOF
+			}
 			return provider.Event{}, err
 		}
 		if strings.TrimSpace(current.Data) == "" {
@@ -428,7 +445,8 @@ func (s *openAIStream) Recv() (provider.Event, error) {
 			return provider.Event{}, err
 		}
 		if parsed.Error != nil {
-			return provider.Event{}, responsesError(parsed.Error)
+			s.state.finished = true
+			return provider.Event{Kind: provider.EventError, Err: responsesError(parsed.Error)}, nil
 		}
 		s.consumeChunk(parsed)
 		if parsed.ID != "" {
@@ -469,14 +487,22 @@ func (s *openAIStream) handleDoneMarker() {
 
 // consumeChunk records usage tokens and dispatches each choice's delta.
 func (s *openAIStream) consumeChunk(parsed chunk) {
-	if parsed.Usage.TotalTokens > 0 || parsed.Usage.PromptTokens > 0 || parsed.Usage.CompletionTokens > 0 ||
+	if parsed.Usage.TotalTokens > 0 || parsed.Usage.PromptTokens != nil || parsed.Usage.CompletionTokens > 0 ||
 		parsed.Usage.PromptTokensDetails.CachedTokens != nil || parsed.Usage.PromptTokensDetails.CacheWriteTokens != nil ||
 		parsed.Usage.CompletionTokensDetails.ReasoningTokens != nil {
+		promptTokens := 0
+		if parsed.Usage.PromptTokens != nil {
+			promptTokens = *parsed.Usage.PromptTokens
+		}
+		if !s.state.contextUsageReported && s.state.contextUsage != nil && parsed.Usage.PromptTokens != nil {
+			s.state.contextUsage(provider.ContextUsage{UsedTokens: promptTokens})
+			s.state.contextUsageReported = true
+		}
 		cachedTokens, cacheReported := reportedToken(parsed.Usage.PromptTokensDetails.CachedTokens)
 		cacheWriteTokens, cacheWriteReported := reportedToken(parsed.Usage.PromptTokensDetails.CacheWriteTokens)
 		reasoningTokens, _ := reportedToken(parsed.Usage.CompletionTokensDetails.ReasoningTokens)
 		s.state.usage = provider.Usage{
-			InputTokens:                   parsed.Usage.PromptTokens,
+			InputTokens:                   promptTokens,
 			CachedInputTokens:             cachedTokens,
 			CachedInputTokensReported:     cacheReported,
 			CacheWriteInputTokens:         cacheWriteTokens,
@@ -541,14 +567,13 @@ func (s *openAIStream) Close() error {
 	return s.body.Close()
 }
 
-func toChatMessages(messages []message.Message) ([]chatMessage, error) {
+func toChatMessages(messages []message.Message) []chatMessage {
 	items := make([]chatMessage, 0, len(messages))
 	for _, msg := range messages {
 		item := chatMessage{Role: string(msg.Role)}
-		var err error
 		switch msg.Role {
 		case message.RoleAssistant:
-			item.Content, err = chatMessageContent(msg.CanonicalContent(), msg.CacheBoundary, msg.Role)
+			item.Content = chatMessageContent(msg.CanonicalContent(), msg.CacheBoundary, msg.Role)
 			item.ReasoningContent = msg.ReasoningContent()
 			if len(msg.ToolCalls) > 0 {
 				item.ToolCalls = make([]chatToolCall, 0, len(msg.ToolCalls))
@@ -565,23 +590,21 @@ func toChatMessages(messages []message.Message) ([]chatMessage, error) {
 			}
 		case message.RoleTool:
 			if msg.ToolResult != nil {
-				item.Content, err = chatMessageContent(msg.ToolResult.CanonicalContent(), msg.CacheBoundary, msg.Role)
+				item.Content = chatMessageContent(msg.ToolResult.CanonicalContent(), msg.CacheBoundary, msg.Role)
 				item.ToolCallID = msg.ToolResult.ToolCallID
 			} else if msg.CacheBoundary {
-				err = fmt.Errorf("openai chat completions cache boundary requires tool result content")
+				shared.WarnDrop("openai chat completions", "cacheBoundary",
+					"cache boundary requires tool result content")
 			}
 		default:
-			item.Content, err = chatMessageContent(msg.CanonicalContent(), msg.CacheBoundary, msg.Role)
-		}
-		if err != nil {
-			return nil, err
+			item.Content = chatMessageContent(msg.CanonicalContent(), msg.CacheBoundary, msg.Role)
 		}
 		items = append(items, item)
 	}
-	return items, nil
+	return items
 }
 
-func chatMessageContent(parts []message.ContentPart, cacheBoundary bool, role message.Role) (any, error) {
+func chatMessageContent(parts []message.ContentPart, cacheBoundary bool, role message.Role) any {
 	blocks := make([]chatContentBlock, 0, len(parts))
 	textOnly := true
 	var plain strings.Builder
@@ -592,23 +615,31 @@ func chatMessageContent(parts []message.ContentPart, cacheBoundary bool, role me
 			blocks = append(blocks, chatContentBlock{Type: "text", Text: part.Text})
 		case message.ContentReasoning:
 			if role != message.RoleAssistant {
-				return nil, fmt.Errorf("openai chat completions does not accept reasoning content for role %s", role)
+				shared.WarnDrop("openai chat completions", "content",
+					fmt.Sprintf("does not accept reasoning content for role %s", role))
 			}
 		case message.ContentRedactedReasoning:
-			return nil, fmt.Errorf("openai chat completions cannot serialize redacted reasoning content")
+			shared.WarnDrop("openai chat completions", "content",
+				"cannot serialize redacted reasoning content")
 		case message.ContentImage:
 			if role != message.RoleUser {
-				return nil, fmt.Errorf("openai chat completions image content requires user role")
+				shared.WarnDrop("openai chat completions", "content",
+					"image content requires user role")
+				continue
 			}
 			url, err := contentPartURL(part)
 			if err != nil {
-				return nil, err
+				shared.WarnDrop("openai chat completions", "content",
+					strings.TrimPrefix(err.Error(), "openai chat completions "))
+				continue
 			}
 			textOnly = false
 			blocks = append(blocks, chatContentBlock{Type: "image_url", ImageURL: &chatImageURL{URL: url}})
 		case message.ContentAudio:
 			if role != message.RoleUser || len(part.Data) == 0 {
-				return nil, fmt.Errorf("openai chat completions audio content requires user-role inline data")
+				shared.WarnDrop("openai chat completions", "content",
+					"audio content requires user-role inline data")
+				continue
 			}
 			textOnly = false
 			blocks = append(blocks, chatContentBlock{Type: "input_audio", InputAudio: &chatInputAudio{
@@ -617,18 +648,24 @@ func chatMessageContent(parts []message.ContentPart, cacheBoundary bool, role me
 			}})
 		case message.ContentFile:
 			if role != message.RoleUser {
-				return nil, fmt.Errorf("openai chat completions file content requires user role")
+				shared.WarnDrop("openai chat completions", "content",
+					"file content requires user role")
+				continue
 			}
 			file, err := chatFilePart(part)
 			if err != nil {
-				return nil, err
+				shared.WarnDrop("openai chat completions", "content",
+					strings.TrimPrefix(err.Error(), "openai chat completions "))
+				continue
 			}
 			textOnly = false
 			blocks = append(blocks, chatContentBlock{Type: "file", File: file})
 		case message.ContentSource, message.ContentProviderData:
-			return nil, fmt.Errorf("openai chat completions cannot serialize %s content", part.Kind)
+			shared.WarnDrop("openai chat completions", "content",
+				fmt.Sprintf("cannot serialize %s content", part.Kind))
 		default:
-			return nil, fmt.Errorf("openai chat completions received unknown content kind %q", part.Kind)
+			shared.WarnDrop("openai chat completions", "content",
+				fmt.Sprintf("received unknown content kind %q", part.Kind))
 		}
 	}
 	if cacheBoundary {
@@ -636,21 +673,26 @@ func chatMessageContent(parts []message.ContentPart, cacheBoundary bool, role me
 	}
 	if textOnly {
 		if plain.Len() == 0 {
-			return nil, nil
+			return nil
 		}
-		return plain.String(), nil
+		return plain.String()
 	}
-	return blocks, nil
+	return blocks
 }
 
-func chatContentWithCacheBoundary(blocks []chatContentBlock) (any, error) {
+func chatContentWithCacheBoundary(blocks []chatContentBlock) any {
 	for index := len(blocks) - 1; index >= 0; index-- {
 		if blocks[index].Type == "text" && blocks[index].Text != "" {
 			blocks[index].PromptCacheBreakpoint = &chatCacheBreakpoint{Mode: PromptCacheModeExplicit}
-			return blocks, nil
+			return blocks
 		}
 	}
-	return nil, fmt.Errorf("openai chat completions cache boundary requires non-empty text")
+	shared.WarnDrop("openai chat completions", "cacheBoundary",
+		"cache boundary requires non-empty text")
+	if len(blocks) == 0 {
+		return nil
+	}
+	return blocks
 }
 
 func contentPartURL(part message.ContentPart) (string, error) {

@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -17,6 +18,50 @@ import (
 	"github.com/Viking602/venat/provider"
 	"github.com/Viking602/venat/provider/shared"
 )
+
+type responsesTestLogRecord struct {
+	message string
+	attrs   map[string]string
+}
+
+type responsesTestLogRecorder struct {
+	records []responsesTestLogRecord
+}
+
+func (r *responsesTestLogRecorder) Enabled(_ context.Context, _ slog.Level) bool {
+	return true
+}
+
+func (r *responsesTestLogRecorder) Handle(_ context.Context, record slog.Record) error {
+	attrs := make(map[string]string)
+	record.Attrs(func(attr slog.Attr) bool {
+		attrs[attr.Key] = attr.Value.String()
+		return true
+	})
+	r.records = append(r.records, responsesTestLogRecord{message: record.Message, attrs: attrs})
+	return nil
+}
+
+func (r *responsesTestLogRecorder) WithAttrs(_ []slog.Attr) slog.Handler {
+	return r
+}
+
+func (r *responsesTestLogRecorder) WithGroup(_ string) slog.Handler {
+	return r
+}
+
+func requireResponsesDropWarning(t *testing.T, recorder *responsesTestLogRecorder, field, reason string) {
+	t.Helper()
+	for _, record := range recorder.records {
+		if record.message == "dropping unsupported request field" &&
+			record.attrs["provider"] == "openai responses" &&
+			record.attrs["field"] == field &&
+			record.attrs["reason"] == reason {
+			return
+		}
+	}
+	t.Fatalf("warning = %#v, want field %q reason %q", recorder.records, field, reason)
+}
 
 func TestNewDefaultsToResponsesWireAndCurrentModels(t *testing.T) {
 	driver := New(Config{})
@@ -222,18 +267,178 @@ func TestDriverStreamBuildsResponsesRequest(t *testing.T) {
 	requireResponsesInclude(t, captured["include"])
 }
 
-func TestDriverStreamRejectsResponsesStopSequences(t *testing.T) {
-	driver := New(Config{WireAPI: WireResponses})
+func TestDriverResponsesMapsResponseFormatsAndMetadata(t *testing.T) {
+	tests := []struct {
+		name     string
+		format   *provider.ResponseFormat
+		metadata map[string]string
+	}{
+		{name: "text", format: &provider.ResponseFormat{Type: "text"}},
+		{name: "json object", format: &provider.ResponseFormat{Type: "json_object"}},
+		{
+			name: "json schema raw schema takes precedence",
+			format: &provider.ResponseFormat{
+				Type:      "json_schema",
+				Name:      "report",
+				Strict:    true,
+				RawSchema: json.RawMessage(`{"type":"object","properties":{"raw":{"type":"string"}}}`),
+				Schema:    &message.JSONSchema{Type: "string"},
+			},
+			metadata: map[string]string{"tenant": "acme", "trace": "turn-1"},
+		},
+		{name: "empty metadata", format: &provider.ResponseFormat{Type: "text"}, metadata: map[string]string{}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			var captured map[string]any
+			server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+				if err := json.NewDecoder(request.Body).Decode(&captured); err != nil {
+					t.Error(err)
+				}
+				writer.Header().Set("Content-Type", "text/event-stream")
+				_, _ = writer.Write([]byte(`data: {"type":"response.completed","response":{"output":[],"usage":{"input_tokens":4}}}` + "\n\n"))
+			}))
+			defer server.Close()
+
+			driver := New(Config{APIKey: "test-key", BaseURL: server.URL, Client: server.Client(), WireAPI: WireResponses})
+			stream, err := driver.Stream(context.Background(), provider.Request{
+				Model:          "gpt-test",
+				Messages:       []message.Message{message.NewText(message.RoleUser, "hi")},
+				ResponseFormat: test.format,
+				Metadata:       test.metadata,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			_ = collectEvents(t, stream)
+
+			text, ok := captured["text"].(map[string]any)
+			if !ok {
+				t.Fatalf("text = %#v, want text object", captured["text"])
+			}
+			format, ok := text["format"].(map[string]any)
+			if !ok || format["type"] != test.format.Type {
+				t.Fatalf("text.format = %#v, want type %q", text["format"], test.format.Type)
+			}
+			if test.format.Type == "json_schema" {
+				if format["name"] != "report" || format["strict"] != true {
+					t.Fatalf("text.format = %#v, want schema metadata", format)
+				}
+				schema, ok := format["schema"].(map[string]any)
+				if !ok || schema["type"] != "object" {
+					t.Fatalf("text.format.schema = %#v, want raw schema", format["schema"])
+				}
+			}
+			metadata, present := captured["metadata"].(map[string]any)
+			if len(test.metadata) == 0 {
+				if present {
+					t.Fatalf("metadata = %#v, want field omitted", captured["metadata"])
+				}
+			} else if !present || metadata["tenant"] != "acme" || metadata["trace"] != "turn-1" {
+				t.Fatalf("metadata = %#v, want request metadata", captured["metadata"])
+			}
+		})
+	}
+}
+
+func TestDriverResponsesDropsInvalidResponseFormat(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		format *provider.ResponseFormat
+		reason string
+	}{
+		{name: "unknown type", format: &provider.ResponseFormat{Type: "xml"}, reason: `unsupported response format type "xml"`},
+		{name: "empty type", format: &provider.ResponseFormat{}, reason: `unsupported response format type ""`},
+		{name: "json schema without schema", format: &provider.ResponseFormat{Type: "json_schema"}, reason: "requires schema"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			var captured map[string]any
+			server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+				if err := json.NewDecoder(request.Body).Decode(&captured); err != nil {
+					t.Errorf("decode request: %v", err)
+				}
+				writer.Header().Set("Content-Type", "text/event-stream")
+				_, _ = writer.Write([]byte(`data: {"type":"response.completed","response":{"output":[]}}` + "\n\n"))
+			}))
+			defer server.Close()
+
+			recorder := &responsesTestLogRecorder{}
+			previous := slog.Default()
+			slog.SetDefault(slog.New(recorder))
+			defer slog.SetDefault(previous)
+
+			driver := New(Config{APIKey: "test-key", BaseURL: server.URL, Client: server.Client(), WireAPI: WireResponses})
+			stream, err := driver.Stream(context.Background(), provider.Request{
+				Model:          "gpt-test",
+				Messages:       []message.Message{message.NewText(message.RoleUser, "hi")},
+				ResponseFormat: test.format,
+			})
+			if err != nil {
+				t.Fatalf("Stream() error = %v", err)
+			}
+			_ = collectEvents(t, stream)
+			if _, present := captured["text"]; present {
+				t.Fatalf("text = %#v, want omitted for invalid response format", captured["text"])
+			}
+			requireResponsesDropWarning(t, recorder, "responseFormat", test.reason)
+		})
+	}
+}
+
+func TestDriverResponsesReportsContextUsageOnce(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		writer.Header().Set("Content-Type", "text/event-stream")
+		_, _ = writer.Write([]byte(`data: {"type":"response.completed","response":{"output":[],"usage":{"input_tokens":12}}}` + "\n\n"))
+	}))
+	defer server.Close()
+
+	var observed []provider.ContextUsage
+	driver := New(Config{APIKey: "test-key", BaseURL: server.URL, Client: server.Client(), WireAPI: WireResponses})
 	stream, err := driver.Stream(context.Background(), provider.Request{
+		Model:    "gpt-test",
+		Messages: []message.Message{message.NewText(message.RoleUser, "hi")},
+		ContextUsage: func(usage provider.ContextUsage) {
+			observed = append(observed, usage)
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = collectEvents(t, stream)
+	if len(observed) != 1 || observed[0].UsedTokens != 12 || observed[0].MaxTokens != 0 {
+		t.Fatalf("context usage observations = %#v, want one observation with 12 used tokens", observed)
+	}
+}
+
+func TestDriverStreamDropsResponsesStopSequences(t *testing.T) {
+	var captured map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if err := json.NewDecoder(request.Body).Decode(&captured); err != nil {
+			t.Errorf("decode request: %v", err)
+		}
+		writer.Header().Set("Content-Type", "text/event-stream")
+		_, _ = writer.Write([]byte(`data: {"type":"response.completed","response":{"output":[]}}` + "\n\n"))
+	}))
+	defer server.Close()
+
+	recorder := &responsesTestLogRecorder{}
+	previous := slog.Default()
+	slog.SetDefault(slog.New(recorder))
+	defer slog.SetDefault(previous)
+
+	driver := New(Config{APIKey: "test", BaseURL: server.URL, Client: server.Client(), WireAPI: WireResponses})
+	stream, err := driver.Stream(context.Background(), provider.Request{
+		Model:         "gpt-test",
 		StopSequences: []string{"stop"},
 	})
-	if stream != nil {
-		_ = stream.Close()
-		t.Fatal("Stream() returned a stream with unsupported stop sequences")
+	if err != nil {
+		t.Fatalf("Stream() error = %v", err)
 	}
-	if err == nil || !strings.Contains(err.Error(), "does not support stop sequences") {
-		t.Fatalf("Stream() error = %v, want stop-sequence error", err)
+	_ = collectEvents(t, stream)
+	if _, present := captured["stop"]; present {
+		t.Fatalf("stop = %#v, want omitted", captured["stop"])
 	}
+	requireResponsesDropWarning(t, recorder, "stopSequences", "does not support stop sequences")
 }
 
 func requireResponsesInput(t *testing.T, value any) {
@@ -316,34 +521,74 @@ func requireResponsesReasoningAndText(t *testing.T, captured map[string]any) {
 	}
 }
 
-func TestDriverStreamRejectsResponsesReasoningEffortConflict(t *testing.T) {
-	driver := New(Config{APIKey: "test"})
+func TestDriverStreamDropsResponsesReasoningEffortConflict(t *testing.T) {
+	var captured map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if err := json.NewDecoder(request.Body).Decode(&captured); err != nil {
+			t.Errorf("decode request: %v", err)
+		}
+		writer.Header().Set("Content-Type", "text/event-stream")
+		_, _ = writer.Write([]byte(`data: {"type":"response.completed","response":{"output":[]}}` + "\n\n"))
+	}))
+	defer server.Close()
+
+	recorder := &responsesTestLogRecorder{}
+	previous := slog.Default()
+	slog.SetDefault(slog.New(recorder))
+	defer slog.SetDefault(previous)
+
+	driver := New(Config{APIKey: "test", BaseURL: server.URL, Client: server.Client(), WireAPI: WireResponses})
 	stream, err := driver.Stream(context.Background(), provider.Request{
+		Model:          "gpt-test",
 		Messages:       []message.Message{message.NewText(message.RoleUser, "hi")},
 		ThinkingBudget: 5000,
 		ExtraBody:      map[string]any{"reasoning": map[string]any{"effort": "high"}},
 	})
-	if stream != nil {
-		_ = stream.Close()
-		t.Fatal("Stream() returned a stream for conflicting reasoning effort")
+	if err != nil {
+		t.Fatalf("Stream() error = %v", err)
 	}
-	if err == nil || !strings.Contains(err.Error(), "reasoning.effort conflicts") {
-		t.Fatalf("Stream() error = %v, want managed-field conflict", err)
+	_ = collectEvents(t, stream)
+	reasoning, _ := captured["reasoning"].(map[string]any)
+	if reasoning["effort"] == "high" || reasoning["effort"] == nil {
+		t.Fatalf("reasoning = %#v, want typed effort", reasoning)
 	}
+	requireResponsesDropWarning(t, recorder, "extraBody", "reasoning.effort conflicts with a managed request field")
 }
 
-func TestDriverStreamRejectsInvalidResponsesCacheBoundary(t *testing.T) {
-	driver := New(Config{APIKey: "test"})
+func TestDriverStreamDropsInvalidResponsesCacheBoundary(t *testing.T) {
+	var captured map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if err := json.NewDecoder(request.Body).Decode(&captured); err != nil {
+			t.Errorf("decode request: %v", err)
+		}
+		writer.Header().Set("Content-Type", "text/event-stream")
+		_, _ = writer.Write([]byte(`data: {"type":"response.completed","response":{"output":[]}}` + "\n\n"))
+	}))
+	defer server.Close()
+
+	recorder := &responsesTestLogRecorder{}
+	previous := slog.Default()
+	slog.SetDefault(slog.New(recorder))
+	defer slog.SetDefault(previous)
+
+	driver := New(Config{APIKey: "test", BaseURL: server.URL, Client: server.Client(), WireAPI: WireResponses})
 	stream, err := driver.Stream(context.Background(), provider.Request{
+		Model:    "gpt-test",
 		Messages: []message.Message{{Role: message.RoleUser, CacheBoundary: true}},
 	})
-	if stream != nil {
-		_ = stream.Close()
-		t.Fatal("Stream() returned a stream for an empty cache boundary")
+	if err != nil {
+		t.Fatalf("Stream() error = %v", err)
 	}
-	if err == nil || !strings.Contains(err.Error(), "requires non-empty text") {
-		t.Fatalf("Stream() error = %v, want cache-boundary validation error", err)
+	_ = collectEvents(t, stream)
+	input, _ := captured["input"].([]any)
+	if len(input) != 1 {
+		t.Fatalf("input = %#v, want one item", captured["input"])
 	}
+	item, _ := input[0].(map[string]any)
+	if _, present := item["prompt_cache_breakpoint"]; present {
+		t.Fatalf("input item = %#v, want no cache boundary marker", item)
+	}
+	requireResponsesDropWarning(t, recorder, "cacheBoundary", "requires non-empty text")
 }
 
 func TestResponsesInputBuildsToolResultCacheBoundary(t *testing.T) {
@@ -385,10 +630,26 @@ func TestResponsesInputBuildsToolResultCacheBoundary(t *testing.T) {
 
 	result.ToolResult.Content = ""
 	result.ToolResult.Parts = nil
-	if _, err := toResponsesInput([]message.Message{result}); err == nil ||
-		!strings.Contains(err.Error(), "requires non-empty tool result text") {
+	recorder := &responsesTestLogRecorder{}
+	previous := slog.Default()
+	slog.SetDefault(slog.New(recorder))
+	defer slog.SetDefault(previous)
+	emptyItems, err := toResponsesInput([]message.Message{result})
+	if err != nil {
 		t.Fatalf("empty tool result cache boundary error = %v", err)
 	}
+	var emptyOutput map[string]any
+	if err := json.Unmarshal(emptyItems[0], &emptyOutput); err != nil {
+		t.Fatalf("decode empty tool output: %v", err)
+	}
+	emptyContent, _ := emptyOutput["output"].(string)
+	if emptyContent != "" {
+		t.Fatalf("empty tool output = %#v, want empty content", emptyOutput["output"])
+	}
+	if _, present := emptyOutput["prompt_cache_breakpoint"]; present {
+		t.Fatalf("empty tool output = %#v, want no cache boundary marker", emptyOutput)
+	}
+	requireResponsesDropWarning(t, recorder, "cacheBoundary", "requires non-empty tool result text")
 }
 
 func TestDriverStreamBuildsChatCompletionsCacheBoundary(t *testing.T) {
@@ -582,21 +843,44 @@ func TestDriverStreamReplaysResponsesProviderStateBeforeToolOutput(t *testing.T)
 	}
 }
 
-func TestDriverStreamRejectsInvalidResponsesProviderState(t *testing.T) {
-	driver := New(Config{APIKey: "test", WireAPI: WireResponses})
+func TestDriverStreamDropsInvalidResponsesProviderState(t *testing.T) {
+	var captured map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if err := json.NewDecoder(request.Body).Decode(&captured); err != nil {
+			t.Errorf("decode request: %v", err)
+		}
+		writer.Header().Set("Content-Type", "text/event-stream")
+		_, _ = writer.Write([]byte(`data: {"type":"response.completed","response":{"output":[]}}` + "\n\n"))
+	}))
+	defer server.Close()
+
+	recorder := &responsesTestLogRecorder{}
+	previous := slog.Default()
+	slog.SetDefault(slog.New(recorder))
+	defer slog.SetDefault(previous)
+
+	driver := New(Config{APIKey: "test", BaseURL: server.URL, Client: server.Client(), WireAPI: WireResponses})
 	stream, err := driver.Stream(context.Background(), provider.Request{
+		Model: "gpt-test",
 		Messages: []message.Message{{
 			Role:          message.RoleAssistant,
+			Text:          "fallback",
 			ProviderState: json.RawMessage(`{"type":"reasoning"}`),
 		}},
 	})
-	if stream != nil {
-		_ = stream.Close()
-		t.Fatal("Stream() returned a stream for invalid provider state")
+	if err != nil {
+		t.Fatalf("Stream() error = %v", err)
 	}
-	if err == nil || !strings.Contains(err.Error(), "provider state must be a JSON array") {
-		t.Fatalf("Stream() error = %v, want JSON array validation error", err)
+	_ = collectEvents(t, stream)
+	input, _ := captured["input"].([]any)
+	if len(input) != 1 {
+		t.Fatalf("input = %#v, want one fallback item", captured["input"])
 	}
+	item, _ := input[0].(map[string]any)
+	if item["role"] != "assistant" || item["content"] != "fallback" {
+		t.Fatalf("fallback input = %#v", item)
+	}
+	requireResponsesDropWarning(t, recorder, "providerState", "provider state must be a JSON array")
 }
 
 func TestResponsesStreamSkipsKeepaliveFrames(t *testing.T) {
@@ -938,5 +1222,97 @@ func TestResponsesInputPreservesCanonicalMultimodalContent(t *testing.T) {
 	if len(input.Content) != 2 || input.Content[0]["text"] != "inspect" ||
 		input.Content[1]["image_url"] != "data:image/png;base64,AQID" {
 		t.Fatalf("responses multimodal content = %#v", input.Content)
+	}
+}
+
+func TestResponsesStreamKeepsBuiltInToolCallsInProviderState(t *testing.T) {
+	stream := newResponsesTestStream(`data: {"type":"response.output_item.added","output_index":0,"item":{"id":"ws_1","type":"web_search_call","status":"in_progress","action":{"type":"search","query":"venat"}}}
+
+data: {"type":"response.output_item.done","output_index":0,"item":{"id":"ws_1","type":"web_search_call","status":"completed","action":{"type":"search","query":"venat"}}}
+
+data: {"type":"response.output_item.added","output_index":1,"item":{"id":"ci_1","type":"code_interpreter_call","status":"in_progress","container_id":"ctr_1","code":"print(1)"}}
+
+data: {"type":"response.output_item.done","output_index":1,"item":{"id":"ci_1","type":"code_interpreter_call","status":"completed","container_id":"ctr_1","code":"print(1)","outputs":[]}}
+
+data: {"type":"response.output_item.added","output_index":2,"item":{"id":"fs_1","type":"file_search_call","status":"in_progress","queries":["venat"]}}
+
+data: {"type":"response.output_item.done","output_index":2,"item":{"id":"fs_1","type":"file_search_call","status":"completed","queries":["venat"],"results":[]}}
+
+data: {"type":"response.completed","response":{"output":[{"id":"ws_1","type":"web_search_call","status":"completed","action":{"type":"search","query":"venat"}},{"id":"ci_1","type":"code_interpreter_call","status":"completed","container_id":"ctr_1","code":"print(1)","outputs":[]},{"id":"fs_1","type":"file_search_call","status":"completed","queries":["venat"],"results":[]}],"usage":{}}}
+
+`)
+	events := collectEvents(t, stream)
+	// Hosted tools are executed by the provider inside the response. Emitting
+	// tool-call deltas would route them through the local tool.Bus as unknown
+	// tools; they must stay in ProviderState instead.
+	if len(events) != 1 || events[0].Kind != provider.EventDone {
+		t.Fatalf("events = %#v, want terminal done only", events)
+	}
+	if events[0].StopReason != provider.StopReasonComplete {
+		t.Fatalf("terminal event = %#v, want complete (no local dispatch)", events[0])
+	}
+	state := string(events[0].ProviderState)
+	for _, marker := range []string{"web_search_call", "code_interpreter_call", "file_search_call", `"query":"venat"`, `"code":"print(1)"`, `"queries":["venat"]`} {
+		if !strings.Contains(state, marker) {
+			t.Fatalf("provider state = %s, missing hosted tool payload %q", state, marker)
+		}
+	}
+}
+
+func TestResponsesStreamKeepsDoneOnlyBuiltInToolOutOfDispatch(t *testing.T) {
+	stream := newResponsesTestStream(`data: {"type":"response.output_item.done","output_index":0,"item":{"id":"fs_4","type":"file_search_call","status":"completed","queries":["opaque"]}}
+
+data: {"type":"response.output_item.added","output_index":1,"item":{"id":"fc_1","type":"function_call","call_id":"call_1","name":"lookup","arguments":""}}
+
+data: {"type":"response.function_call_arguments.delta","output_index":1,"delta":"{\"query\":\"venat\"}"}
+
+data: {"type":"response.output_item.done","output_index":1,"item":{"id":"fc_1","type":"function_call","call_id":"call_1","name":"lookup","arguments":"{\"query\":\"venat\"}"}}
+
+data: {"type":"response.completed","response":{"output":[{"id":"fs_4","type":"file_search_call","status":"completed","queries":["opaque"]},{"id":"fc_1","type":"function_call","call_id":"call_1","name":"lookup","arguments":"{\"query\":\"venat\"}"}],"usage":{}}}
+
+`)
+	events := collectEvents(t, stream)
+	// Only the local function_call may surface as a dispatchable delta; the
+	// done-only hosted tool yields nothing.
+	if len(events) != 2 || events[0].Kind != provider.EventToolCallDelta || events[1].Kind != provider.EventDone {
+		t.Fatalf("events = %#v, want one function-call delta and done", events)
+	}
+	if events[0].ToolCallDelta == nil || events[0].ToolCallDelta.ID != "call_1" || events[0].ToolCallDelta.Name != "lookup" {
+		t.Fatalf("function-call delta = %#v", events[0].ToolCallDelta)
+	}
+	if events[1].StopReason != provider.StopReasonToolUse {
+		t.Fatalf("terminal event = %#v, want tool-use for the local call", events[1])
+	}
+	state := string(events[1].ProviderState)
+	if !strings.Contains(state, "file_search_call") || !strings.Contains(state, `"queries":["opaque"]`) {
+		t.Fatalf("provider state = %s, want hosted tool preserved", state)
+	}
+}
+
+func TestResponsesStreamConsumesOpaqueOutputMetadata(t *testing.T) {
+	stream := newResponsesTestStream(`data: {"type":"response.output_item.added","output_index":0,"item":{"id":"msg_1","type":"message","phase":"final_answer"}}
+
+data: {"type":"response.output_text.delta","output_index":0,"delta":"Answer"}
+
+data: {"type":"response.output_text.annotation.added","output_index":0,"content_index":0,"annotation_index":0,"annotation":{"type":"url_citation","url":"https://example.com","title":"Example"}}
+
+data: {"type":"response.output_text.logprobs","output_index":0,"content_index":0,"logprobs":[{"token":"Answer","logprob":-0.1}]}
+
+data: {"type":"response.output_audio.delta","output_index":0,"delta":"AQI="}
+
+data: {"type":"response.output_item.done","output_index":0,"item":{"id":"msg_1","type":"message","phase":"final_answer","content":[{"type":"output_text","text":"Answer","annotations":[{"type":"url_citation","url":"https://example.com","title":"Example"}]},{"type":"output_audio","audio":"AQI=","transcript":"Answer","logprobs":[{"token":"Answer","logprob":-0.1}]}]}}
+
+data: {"type":"response.completed","response":{"output":[{"id":"msg_1","type":"message","phase":"final_answer","content":[{"type":"output_text","text":"Answer","annotations":[{"type":"url_citation","url":"https://example.com","title":"Example"}]},{"type":"output_audio","audio":"AQI=","transcript":"Answer","logprobs":[{"token":"Answer","logprob":-0.1}]}]}],"usage":{}}}
+
+`)
+	events := collectEvents(t, stream)
+	if len(events) != 2 || events[0].Kind != provider.EventTextDelta || events[1].Kind != provider.EventDone {
+		t.Fatalf("events = %#v, want text and done after opaque metadata", events)
+	}
+	state := string(events[1].ProviderState)
+	for _, marker := range []string{`"annotations"`, `"url_citation"`, `"logprobs"`, `"output_audio"`, `"AQI="`} {
+		if !strings.Contains(state, marker) {
+			t.Fatalf("provider state = %s, missing opaque metadata %q", state, marker)
+		}
 	}
 }

@@ -3,7 +3,9 @@ package anthropic
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -14,6 +16,47 @@ import (
 	"github.com/Viking602/venat/provider"
 	"github.com/Viking602/venat/provider/shared"
 )
+
+type anthropicTestLogRecord struct {
+	message string
+	attrs   map[string]string
+}
+
+type anthropicTestLogRecorder struct {
+	records []anthropicTestLogRecord
+}
+
+func (r *anthropicTestLogRecorder) Enabled(context.Context, slog.Level) bool {
+	return true
+}
+
+func (r *anthropicTestLogRecorder) Handle(_ context.Context, record slog.Record) error {
+	attrs := make(map[string]string)
+	record.Attrs(func(attr slog.Attr) bool {
+		attrs[attr.Key] = attr.Value.String()
+		return true
+	})
+	r.records = append(r.records, anthropicTestLogRecord{message: record.Message, attrs: attrs})
+	return nil
+}
+
+func (r *anthropicTestLogRecorder) WithAttrs([]slog.Attr) slog.Handler {
+	return r
+}
+
+func (r *anthropicTestLogRecorder) WithGroup(string) slog.Handler {
+	return r
+}
+
+func (r *anthropicTestLogRecorder) has(field, reason string) bool {
+	for _, record := range r.records {
+		if record.message == "dropping unsupported request field" &&
+			record.attrs["field"] == field && record.attrs["reason"] == reason {
+			return true
+		}
+	}
+	return false
+}
 
 func TestNewDefaultClientHasNoStreamLifetimeTimeout(t *testing.T) {
 	driver := New(Config{})
@@ -41,7 +84,7 @@ func TestDriverStreamParsesMessageSSE(t *testing.T) {
 			t.Fatalf("unexpected path %s", request.URL.Path)
 		}
 		writer.Header().Set("Content-Type", "text/event-stream")
-		_, _ = writer.Write([]byte("event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg-1\",\"model\":\"claude-test\"},\"usage\":{\"input_tokens\":3,\"cache_read_input_tokens\":2,\"cache_creation_input_tokens\":1}}\n\n"))
+		_, _ = writer.Write([]byte("event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg-1\",\"model\":\"claude-test\",\"usage\":{\"input_tokens\":3,\"cache_read_input_tokens\":2,\"cache_creation_input_tokens\":1}}}\n\n"))
 		_, _ = writer.Write([]byte("event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Hello \"}}\n\n"))
 		_, _ = writer.Write([]byte("event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_1\",\"name\":\"lookup\",\"input\":{}}}\n\n"))
 		_, _ = writer.Write([]byte("event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"query\\\":\\\"ve\"}}\n\n"))
@@ -177,15 +220,9 @@ func TestToAnthropicRequestThinkingToolRoundTrip(t *testing.T) {
 		message.NewToolResult(message.ToolResult{ToolCallID: "toolu_1", Name: "weather", Content: "sunny"}),
 	}
 
-	system, messages, err := toAnthropicRequest(history)
-	if err != nil {
-		t.Fatal(err)
-	}
+	system, messages := toAnthropicRequest(history)
 	if system != "you are helpful" {
 		t.Fatalf("system = %q, want extracted system text", system)
-	}
-	if len(messages) != 3 {
-		t.Fatalf("expected user/assistant/tool-result messages, got %d: %#v", len(messages), messages)
 	}
 	assistant := messages[1]
 	if assistant.Role != "assistant" || len(assistant.Content) != 2 {
@@ -220,13 +257,8 @@ func TestToAnthropicRequestCoalescesToolResults(t *testing.T) {
 		message.NewToolResult(message.ToolResult{ToolCallID: "b", Name: "t", Content: "two", IsError: true}),
 	}
 
-	_, messages, err := toAnthropicRequest(history)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(messages) != 2 {
-		t.Fatalf("expected assistant + single coalesced user message, got %d: %#v", len(messages), messages)
-	}
+	_, messages := toAnthropicRequest(history)
+
 	user := messages[1]
 	if user.Role != "user" || len(user.Content) != 2 {
 		t.Fatalf("expected two tool_result blocks in one user message, got %#v", user)
@@ -243,14 +275,11 @@ func TestToAnthropicRequestDropsUnsignedThinking(t *testing.T) {
 	history := []message.Message{
 		{Role: message.RoleAssistant, Thinking: "no signature here", Text: "answer"},
 	}
-
-	_, messages, err := toAnthropicRequest(history)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(messages) != 1 {
-		t.Fatalf("expected one assistant message, got %#v", messages)
-	}
+	recorder := &anthropicTestLogRecorder{}
+	previous := slog.Default()
+	slog.SetDefault(slog.New(recorder))
+	defer slog.SetDefault(previous)
+	_, messages := toAnthropicRequest(history)
 	for _, block := range messages[0].Content {
 		if block.Type == "thinking" {
 			t.Fatalf("unsigned thinking block should be dropped, got %#v", messages[0].Content)
@@ -259,6 +288,97 @@ func TestToAnthropicRequestDropsUnsignedThinking(t *testing.T) {
 	if len(messages[0].Content) != 1 || messages[0].Content[0].Type != "text" {
 		t.Fatalf("expected only the text block, got %#v", messages[0].Content)
 	}
+	if !recorder.has("thinking", "unsigned thinking block dropped") {
+		t.Fatalf("missing unsigned thinking warning: %#v", recorder.records)
+	}
+}
+
+func TestToAnthropicRequestDropsLateSignedThinking(t *testing.T) {
+	recorder := &anthropicTestLogRecorder{}
+	previous := slog.Default()
+	slog.SetDefault(slog.New(recorder))
+	defer slog.SetDefault(previous)
+
+	_, messages := toAnthropicRequest([]message.Message{{
+		Role: message.RoleAssistant,
+		Content: []message.ContentPart{
+			message.TextPart("answer"),
+			message.ReasoningPart("late", "sig"),
+		},
+	}})
+	if len(messages) != 1 || len(messages[0].Content) != 1 || messages[0].Content[0].Type != "text" {
+		t.Fatalf("late thinking content = %#v", messages)
+	}
+	if !recorder.has("thinking", "signed thinking must precede visible assistant content") {
+		t.Fatalf("missing late-thinking warning: %#v", recorder.records)
+	}
+}
+
+func TestDriverStreamDropsMalformedAnthropicProviderState(t *testing.T) {
+	var captured map[string]any
+	server := anthropicContractServer(t, &captured)
+	defer server.Close()
+	recorder := &anthropicTestLogRecorder{}
+	previous := slog.Default()
+	slog.SetDefault(slog.New(recorder))
+	defer slog.SetDefault(previous)
+
+	driver := New(Config{APIKey: "test", BaseURL: server.URL})
+	stream, err := driver.Stream(context.Background(), provider.Request{
+		Model: "claude",
+		Messages: []message.Message{{
+			Role:          message.RoleAssistant,
+			Text:          "fallback",
+			ProviderState: json.RawMessage(`{"type":"reasoning"}`),
+		}},
+	})
+	if err != nil {
+		t.Fatalf("Stream() error = %v", err)
+	}
+	_ = stream.Close()
+	messages, _ := captured["messages"].([]any)
+	content := messages[0].(map[string]any)["content"].([]any)
+	if len(content) != 1 || content[0].(map[string]any)["text"] != "fallback" {
+		t.Fatalf("fallback content = %#v", content)
+	}
+	if !recorder.has("providerState", "decode anthropic provider state") {
+		t.Fatalf("missing provider state warning: %#v", recorder.records)
+	}
+}
+
+func TestDriverStreamRejectsForeignArrayProviderState(t *testing.T) {
+	var captured map[string]any
+	server := anthropicContractServer(t, &captured)
+	defer server.Close()
+	recorder := &anthropicTestLogRecorder{}
+	previous := slog.Default()
+	slog.SetDefault(slog.New(recorder))
+	defer slog.SetDefault(previous)
+
+	driver := New(Config{APIKey: "test", BaseURL: server.URL})
+	// OpenAI Responses provider state is also a JSON array; a model fallback
+	// to Anthropic must not replay those items as Anthropic content blocks.
+	stream, err := driver.Stream(context.Background(), provider.Request{
+		Model: "claude",
+		Messages: []message.Message{{
+			Role: message.RoleAssistant,
+			Text: "fallback",
+			ProviderState: json.RawMessage(
+				`[{"type":"message","id":"msg_1","role":"assistant","content":[{"type":"output_text","text":"hi"}]},{"type":"function_call","call_id":"call_1","name":"lookup","arguments":"{}"}]`),
+		}},
+	})
+	if err != nil {
+		t.Fatalf("Stream() error = %v", err)
+	}
+	_ = stream.Close()
+	messages, _ := captured["messages"].([]any)
+	content := messages[0].(map[string]any)["content"].([]any)
+	if len(content) != 1 || content[0].(map[string]any)["text"] != "fallback" {
+		t.Fatalf("fallback content = %#v, want plain text replay", content)
+	}
+	if !recorder.has("providerState", "decode anthropic provider state") {
+		t.Fatalf("missing provider state warning: %#v", recorder.records)
+	}
 }
 
 func TestToAnthropicRequestEmptyToolInput(t *testing.T) {
@@ -266,10 +386,7 @@ func TestToAnthropicRequestEmptyToolInput(t *testing.T) {
 		{Role: message.RoleAssistant, ToolCalls: []message.ToolCall{{ID: "x", Name: "noop"}}},
 	}
 
-	_, messages, err := toAnthropicRequest(history)
-	if err != nil {
-		t.Fatal(err)
-	}
+	_, messages := toAnthropicRequest(history)
 	block := messages[0].Content[0]
 	if block.Type != "tool_use" || string(block.Input) != "{}" {
 		t.Fatalf("expected empty input rendered as {}, got %#v", block)
@@ -283,6 +400,626 @@ func TestToAnthropicRequestEmptyToolInput(t *testing.T) {
 	}
 }
 
+// --- Request contract: every provider.Request field maps to the wire or is
+// explicitly rejected; nothing is silently dropped. ---
+
+func anthropicContractServer(t *testing.T, captured *map[string]any) *httptest.Server {
+	t.Helper()
+	return httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		_ = json.NewDecoder(request.Body).Decode(captured)
+		writer.Header().Set("Content-Type", "text/event-stream")
+		_, _ = writer.Write([]byte("event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"model\":\"claude\",\"usage\":{\"input_tokens\":7,\"cache_read_input_tokens\":2,\"cache_creation_input_tokens\":1}}}\n\n"))
+		_, _ = writer.Write([]byte("event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"))
+	}))
+}
+
+func TestDriverStreamMapsResponseFormatToOutputConfig(t *testing.T) {
+	tests := []struct {
+		name       string
+		format     *provider.ResponseFormat
+		wantSchema string
+	}{
+		{
+			name:       "raw schema takes precedence",
+			format:     &provider.ResponseFormat{Type: "json_schema", Name: "ignored", RawSchema: json.RawMessage(`{"type":"object"}`), Schema: &message.JSONSchema{Type: "string"}},
+			wantSchema: `{"type":"object"}`,
+		},
+		{
+			name:       "typed schema marshaled",
+			format:     &provider.ResponseFormat{Type: "json_schema", Schema: &message.JSONSchema{Type: "string"}},
+			wantSchema: `{"type":"string"}`,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			var captured map[string]any
+			server := anthropicContractServer(t, &captured)
+			defer server.Close()
+			driver := New(Config{APIKey: "test", BaseURL: server.URL})
+			stream, err := driver.Stream(context.Background(), provider.Request{
+				Model:          "claude",
+				Messages:       []message.Message{message.NewText(message.RoleUser, "hi")},
+				ResponseFormat: test.format,
+			})
+			if err != nil {
+				t.Fatalf("Stream() error = %v", err)
+			}
+			_ = stream.Close()
+			format, _ := captured["output_config"].(map[string]any)["format"].(map[string]any)
+			if format["type"] != "json_schema" {
+				t.Fatalf("output_config.format = %#v", captured["output_config"])
+			}
+			encoded, _ := json.Marshal(format["schema"])
+			if string(encoded) != test.wantSchema {
+				t.Fatalf("schema = %s, want %s", encoded, test.wantSchema)
+			}
+		})
+	}
+}
+
+func TestDriverStreamResponseFormatTextOmitsOutputConfig(t *testing.T) {
+	var captured map[string]any
+	server := anthropicContractServer(t, &captured)
+	defer server.Close()
+	driver := New(Config{APIKey: "test", BaseURL: server.URL})
+	stream, err := driver.Stream(context.Background(), provider.Request{
+		Model:          "claude",
+		Messages:       []message.Message{message.NewText(message.RoleUser, "hi")},
+		ResponseFormat: &provider.ResponseFormat{Type: "text"},
+	})
+	if err != nil {
+		t.Fatalf("Stream() error = %v", err)
+	}
+	_ = stream.Close()
+	if _, present := captured["output_config"]; present {
+		t.Fatalf("text format must omit output_config, got %#v", captured["output_config"])
+	}
+}
+
+func TestDriverStreamDropsUnsupportedResponseFormat(t *testing.T) {
+	tests := []struct {
+		name   string
+		format *provider.ResponseFormat
+		reason string
+	}{
+		{"json_object", &provider.ResponseFormat{Type: "json_object"}, "json_object is unsupported; use json_schema"},
+		{"unknown type", &provider.ResponseFormat{Type: "yaml"}, "unsupported response format type"},
+		{"empty type", &provider.ResponseFormat{Strict: true}, "unsupported response format type"},
+		{"json_schema without schema", &provider.ResponseFormat{Type: "json_schema", Name: "n"}, "json_schema requires schema"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			var captured map[string]any
+			server := anthropicContractServer(t, &captured)
+			defer server.Close()
+			recorder := &anthropicTestLogRecorder{}
+			previous := slog.Default()
+			slog.SetDefault(slog.New(recorder))
+			defer slog.SetDefault(previous)
+
+			driver := New(Config{APIKey: "test", BaseURL: server.URL})
+			stream, err := driver.Stream(context.Background(), provider.Request{
+				Model:          "claude",
+				Messages:       []message.Message{message.NewText(message.RoleUser, "hi")},
+				ResponseFormat: test.format,
+			})
+			if err != nil {
+				t.Fatalf("Stream() error = %v", err)
+			}
+			_ = stream.Close()
+			if _, present := captured["output_config"]; present {
+				t.Fatalf("dropped response format reached request: %#v", captured["output_config"])
+			}
+			if !recorder.has("responseFormat", test.reason) {
+				t.Fatalf("warning missing responseFormat=%q: %#v", test.reason, recorder.records)
+			}
+		})
+	}
+}
+
+func TestDriverStreamCacheBoundaryMarksBlocks(t *testing.T) {
+	t.Run("system becomes block array", func(t *testing.T) {
+		var captured map[string]any
+		server := anthropicContractServer(t, &captured)
+		defer server.Close()
+		system := message.NewText(message.RoleSystem, "stable")
+		system.CacheBoundary = true
+		driver := New(Config{APIKey: "test", BaseURL: server.URL})
+		stream, err := driver.Stream(context.Background(), provider.Request{
+			Model:    "claude",
+			Messages: []message.Message{system, message.NewText(message.RoleUser, "hi")},
+		})
+		if err != nil {
+			t.Fatalf("Stream() error = %v", err)
+		}
+		_ = stream.Close()
+		blocks, ok := captured["system"].([]any)
+		if !ok || len(blocks) != 1 {
+			t.Fatalf("system = %#v, want single-element block array", captured["system"])
+		}
+		block, _ := blocks[0].(map[string]any)
+		cache, _ := block["cache_control"].(map[string]any)
+		if block["text"] != "stable" || cache["type"] != "ephemeral" {
+			t.Fatalf("system block = %#v", block)
+		}
+	})
+	t.Run("user message marks last text block", func(t *testing.T) {
+		var captured map[string]any
+		server := anthropicContractServer(t, &captured)
+		defer server.Close()
+		user := message.Message{
+			Role:          message.RoleUser,
+			CacheBoundary: true,
+			Content: []message.ContentPart{
+				{Kind: message.ContentText, Text: "first"},
+				{Kind: message.ContentText, Text: "second"},
+			},
+		}
+		driver := New(Config{APIKey: "test", BaseURL: server.URL})
+		stream, err := driver.Stream(context.Background(), provider.Request{
+			Model:    "claude",
+			Messages: []message.Message{user},
+		})
+		if err != nil {
+			t.Fatalf("Stream() error = %v", err)
+		}
+		_ = stream.Close()
+		messages, _ := captured["messages"].([]any)
+		content, _ := messages[0].(map[string]any)["content"].([]any)
+		first, _ := content[0].(map[string]any)
+		second, _ := content[1].(map[string]any)
+		if _, marked := first["cache_control"]; marked {
+			t.Fatalf("first block must not carry cache_control: %#v", first)
+		}
+		if second["cache_control"].(map[string]any)["type"] != "ephemeral" {
+			t.Fatalf("last block = %#v, want cache_control ephemeral", second)
+		}
+	})
+	t.Run("tool result marks tool_result block", func(t *testing.T) {
+		var captured map[string]any
+		server := anthropicContractServer(t, &captured)
+		defer server.Close()
+		result := message.NewToolResult(message.ToolResult{ToolCallID: "call_1", Name: "lookup", Content: "found"})
+		result.CacheBoundary = true
+		driver := New(Config{APIKey: "test", BaseURL: server.URL})
+		stream, err := driver.Stream(context.Background(), provider.Request{
+			Model:    "claude",
+			Messages: []message.Message{result},
+		})
+		if err != nil {
+			t.Fatalf("Stream() error = %v", err)
+		}
+		_ = stream.Close()
+		messages, _ := captured["messages"].([]any)
+		content, _ := messages[0].(map[string]any)["content"].([]any)
+		block, _ := content[0].(map[string]any)
+		if block["type"] != "tool_result" || block["cache_control"].(map[string]any)["type"] != "ephemeral" {
+			t.Fatalf("tool_result block = %#v, want cache_control ephemeral", block)
+		}
+	})
+	t.Run("empty text drops boundary marker", func(t *testing.T) {
+		var captured map[string]any
+		server := anthropicContractServer(t, &captured)
+		defer server.Close()
+		recorder := &anthropicTestLogRecorder{}
+		previous := slog.Default()
+		slog.SetDefault(slog.New(recorder))
+		defer slog.SetDefault(previous)
+
+		empty := message.NewText(message.RoleUser, "")
+		empty.CacheBoundary = true
+		driver := New(Config{APIKey: "test", BaseURL: server.URL})
+		stream, err := driver.Stream(context.Background(), provider.Request{
+			Model: "claude", Messages: []message.Message{empty},
+		})
+		if err != nil {
+			t.Fatalf("Stream() error = %v", err)
+		}
+		_ = stream.Close()
+		messages, _ := captured["messages"].([]any)
+		block := messages[0].(map[string]any)["content"].([]any)[0].(map[string]any)
+		if _, marked := block["cache_control"]; marked {
+			t.Fatalf("empty boundary must omit cache_control: %#v", block)
+		}
+		if !recorder.has("cacheBoundary", "cache boundary requires non-empty text") {
+			t.Fatalf("missing cache boundary warning: %#v", recorder.records)
+		}
+	})
+	t.Run("tool without result drops boundary marker", func(t *testing.T) {
+		var captured map[string]any
+		server := anthropicContractServer(t, &captured)
+		defer server.Close()
+		recorder := &anthropicTestLogRecorder{}
+		previous := slog.Default()
+		slog.SetDefault(slog.New(recorder))
+		defer slog.SetDefault(previous)
+
+		invalid := message.Message{Role: message.RoleTool, CacheBoundary: true}
+		driver := New(Config{APIKey: "test", BaseURL: server.URL})
+		stream, err := driver.Stream(context.Background(), provider.Request{
+			Model: "claude", Messages: []message.Message{message.NewText(message.RoleUser, "keep"), invalid},
+		})
+		if err != nil {
+			t.Fatalf("Stream() error = %v", err)
+		}
+		_ = stream.Close()
+		messages, _ := captured["messages"].([]any)
+		if len(messages) != 1 {
+			t.Fatalf("tool without result changed content: %#v", messages)
+		}
+		if !recorder.has("cacheBoundary", "cache boundary requires a tool result") {
+			t.Fatalf("missing tool-result boundary warning: %#v", recorder.records)
+		}
+	})
+	t.Run("empty tool result text drops boundary marker", func(t *testing.T) {
+		var captured map[string]any
+		server := anthropicContractServer(t, &captured)
+		defer server.Close()
+		recorder := &anthropicTestLogRecorder{}
+		previous := slog.Default()
+		slog.SetDefault(slog.New(recorder))
+		defer slog.SetDefault(previous)
+
+		result := message.NewToolResult(message.ToolResult{ToolCallID: "call_1", Name: "lookup"})
+		result.CacheBoundary = true
+		driver := New(Config{APIKey: "test", BaseURL: server.URL})
+		stream, err := driver.Stream(context.Background(), provider.Request{
+			Model: "claude", Messages: []message.Message{result},
+		})
+		if err != nil {
+			t.Fatalf("Stream() error = %v", err)
+		}
+		_ = stream.Close()
+		messages, _ := captured["messages"].([]any)
+		block := messages[0].(map[string]any)["content"].([]any)[0].(map[string]any)
+		if _, marked := block["cache_control"]; marked {
+			t.Fatalf("empty tool result boundary must omit cache_control: %#v", block)
+		}
+		if !recorder.has("cacheBoundary", "cache boundary requires non-empty tool result text") {
+			t.Fatalf("missing empty tool-result warning: %#v", recorder.records)
+		}
+	})
+}
+
+func TestDriverStreamParallelToolCallsMapToToolChoice(t *testing.T) {
+	tools := []message.ToolDefinition{{Name: "lookup", InputSchema: message.JSONSchema{Type: "object"}}}
+	disabled := false
+	enabled := true
+	tests := []struct {
+		name     string
+		parallel *bool
+		tools    []message.ToolDefinition
+		want     map[string]any
+	}{
+		{"false with tools", &disabled, tools, map[string]any{"type": "auto", "disable_parallel_tool_use": true}},
+		{"false without tools", &disabled, nil, nil},
+		{"true with tools", &enabled, tools, nil},
+		{"unset", nil, tools, nil},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			var captured map[string]any
+			server := anthropicContractServer(t, &captured)
+			defer server.Close()
+			driver := New(Config{APIKey: "test", BaseURL: server.URL})
+			stream, err := driver.Stream(context.Background(), provider.Request{
+				Model:             "claude",
+				Messages:          []message.Message{message.NewText(message.RoleUser, "hi")},
+				Tools:             test.tools,
+				ParallelToolCalls: test.parallel,
+			})
+			if err != nil {
+				t.Fatalf("Stream() error = %v", err)
+			}
+			_ = stream.Close()
+			choice, present := captured["tool_choice"]
+			if test.want == nil {
+				if present {
+					t.Fatalf("tool_choice = %#v, want absent", choice)
+				}
+				return
+			}
+			got, _ := choice.(map[string]any)
+			if got["type"] != test.want["type"] || got["disable_parallel_tool_use"] != test.want["disable_parallel_tool_use"] {
+				t.Fatalf("tool_choice = %#v, want %#v", got, test.want)
+			}
+		})
+	}
+}
+
+func TestDriverStreamMetadataRestrictedToUserID(t *testing.T) {
+	var captured map[string]any
+	server := anthropicContractServer(t, &captured)
+	defer server.Close()
+	driver := New(Config{APIKey: "test", BaseURL: server.URL})
+	stream, err := driver.Stream(context.Background(), provider.Request{
+		Model:    "claude",
+		Messages: []message.Message{message.NewText(message.RoleUser, "hi")},
+		Metadata: map[string]string{"user_id": "usr_1"},
+	})
+	if err != nil {
+		t.Fatalf("Stream() error = %v", err)
+	}
+	_ = stream.Close()
+	metadata, _ := captured["metadata"].(map[string]any)
+	if metadata["user_id"] != "usr_1" || len(metadata) != 1 {
+		t.Fatalf("metadata = %#v", metadata)
+	}
+
+	recorder := &anthropicTestLogRecorder{}
+	previous := slog.Default()
+	slog.SetDefault(slog.New(recorder))
+	defer slog.SetDefault(previous)
+	stream, err = driver.Stream(context.Background(), provider.Request{
+		Model:    "claude",
+		Messages: []message.Message{message.NewText(message.RoleUser, "hi")},
+		Metadata: map[string]string{"user_id": "usr_1", "tenant": "t", "trace": "x"},
+	})
+	if err != nil {
+		t.Fatalf("Stream() error = %v", err)
+	}
+	_ = stream.Close()
+	metadata, _ = captured["metadata"].(map[string]any)
+	if metadata["user_id"] != "usr_1" || len(metadata) != 1 {
+		t.Fatalf("metadata = %#v", metadata)
+	}
+	if !recorder.has("metadata", "metadata keys unsupported: tenant, trace") {
+		t.Fatalf("missing metadata warning: %#v", recorder.records)
+	}
+}
+
+func TestDriverStreamDropsPromptCacheKeyAndServiceTier(t *testing.T) {
+	tests := []struct {
+		name    string
+		request provider.Request
+		field   string
+		reason  string
+	}{
+		{"prompt cache key", provider.Request{PromptCacheKey: "key"}, "promptCacheKey", "prompt cache key is unsupported"},
+		{"service tier", provider.Request{ServiceTier: "priority"}, "serviceTier", "service tier is unsupported; use config.betas for beta tiers"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			var captured map[string]any
+			server := anthropicContractServer(t, &captured)
+			defer server.Close()
+			recorder := &anthropicTestLogRecorder{}
+			previous := slog.Default()
+			slog.SetDefault(slog.New(recorder))
+			defer slog.SetDefault(previous)
+
+			test.request.Model = "claude"
+			test.request.Messages = []message.Message{message.NewText(message.RoleUser, "hi")}
+			driver := New(Config{APIKey: "test", BaseURL: server.URL})
+			stream, err := driver.Stream(context.Background(), test.request)
+			if err != nil {
+				t.Fatalf("Stream() error = %v", err)
+			}
+			_ = stream.Close()
+			if _, present := captured[test.field]; present {
+				t.Fatalf("dropped field %s reached request: %#v", test.field, captured)
+			}
+			if !recorder.has(test.field, test.reason) {
+				t.Fatalf("missing %s warning: %#v", test.field, recorder.records)
+			}
+		})
+	}
+}
+
+func TestDriverStreamMergesExtraBody(t *testing.T) {
+	var captured map[string]any
+	server := anthropicContractServer(t, &captured)
+	defer server.Close()
+	driver := New(Config{APIKey: "test", BaseURL: server.URL})
+	stream, err := driver.Stream(context.Background(), provider.Request{
+		Model:       "claude",
+		Messages:    []message.Message{message.NewText(message.RoleUser, "hi")},
+		Temperature: 0.5,
+		ExtraBody: map[string]any{
+			"custom_flag": true,
+			"stream":      false, // managed: stripped
+			"temperature": 0.9,   // protected: typed value wins
+			"top_p":       0.7,   // protected: typed unset, fills
+		},
+	})
+	if err != nil {
+		t.Fatalf("Stream() error = %v", err)
+	}
+	_ = stream.Close()
+	if captured["custom_flag"] != true {
+		t.Fatalf("unmanaged extra body field dropped: %#v", captured)
+	}
+	if captured["stream"] != true {
+		t.Fatalf("managed extra body field must not override: %#v", captured["stream"])
+	}
+	if captured["temperature"] != 0.5 {
+		t.Fatalf("protected typed temperature overwritten: %#v", captured["temperature"])
+	}
+	if captured["top_p"] != 0.7 {
+		t.Fatalf("protected empty top_p must fill from extra body: %#v", captured["top_p"])
+	}
+}
+
+func TestDriverStreamReportsContextUsageOnce(t *testing.T) {
+	var captured map[string]any
+	server := anthropicContractServer(t, &captured)
+	defer server.Close()
+	calls := 0
+	var observed provider.ContextUsage
+	driver := New(Config{APIKey: "test", BaseURL: server.URL})
+	stream, err := driver.Stream(context.Background(), provider.Request{
+		Model:    "claude",
+		Messages: []message.Message{message.NewText(message.RoleUser, "hi")},
+		ContextUsage: func(usage provider.ContextUsage) {
+			calls++
+			observed = usage
+		},
+	})
+	if err != nil {
+		t.Fatalf("Stream() error = %v", err)
+	}
+	for {
+		_, err := stream.Recv()
+		if err != nil {
+			break
+		}
+	}
+	_ = stream.Close()
+	if calls != 1 {
+		t.Fatalf("ContextUsage called %d times, want 1", calls)
+	}
+	// input_tokens 7 + cache_read 2 + cache_creation 1 = 10
+	if observed.UsedTokens != 10 || observed.MaxTokens != 0 {
+		t.Fatalf("context usage = %#v, want UsedTokens 10", observed)
+	}
+
+	// nil observer must not panic
+	stream, err = driver.Stream(context.Background(), provider.Request{
+		Model:    "claude",
+		Messages: []message.Message{message.NewText(message.RoleUser, "hi")},
+	})
+	if err != nil {
+		t.Fatalf("Stream() error = %v", err)
+	}
+	for {
+		_, err := stream.Recv()
+		if err != nil {
+			break
+		}
+	}
+	_ = stream.Close()
+}
+
+func TestDriverStreamPreservesTruncationOverDecodeError(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		writer.Header().Set("Content-Type", "text/event-stream")
+		// Cut mid-JSON: the partial frame must surface the truncation error
+		// (retryable) instead of a json.SyntaxError (not retryable).
+		_, _ = writer.Write([]byte("event: content_block_delta\ndata: {\"type\":\"content_blo"))
+	}))
+	defer server.Close()
+	driver := New(Config{APIKey: "test", BaseURL: server.URL})
+	stream, err := driver.Stream(context.Background(), provider.Request{
+		Model:    "claude",
+		Messages: []message.Message{message.NewText(message.RoleUser, "hi")},
+	})
+	if err != nil {
+		t.Fatalf("Stream() error = %v", err)
+	}
+	defer func() { _ = stream.Close() }()
+	_, recvErr := stream.Recv()
+	if !errors.Is(recvErr, io.ErrUnexpectedEOF) {
+		t.Fatalf("Recv() error = %v, want io.ErrUnexpectedEOF (retryable), not a decode error", recvErr)
+	}
+	if provider.IsRetryableError(recvErr) != true {
+		t.Fatalf("Recv() error = %v, want retryable per OpenRetryingStream policy", recvErr)
+	}
+}
+
+func TestDriverStreamCacheBoundaryCoversToolUse(t *testing.T) {
+	var captured map[string]any
+	server := anthropicContractServer(t, &captured)
+	defer server.Close()
+	driver := New(Config{APIKey: "test", BaseURL: server.URL})
+	assistant := message.Message{
+		Role:          message.RoleAssistant,
+		Text:          "working",
+		CacheBoundary: true,
+		ToolCalls: []message.ToolCall{{
+			ID: "call_1", Name: "lookup", Arguments: json.RawMessage(`{"query":"venat"}`),
+		}},
+	}
+	stream, err := driver.Stream(context.Background(), provider.Request{
+		Model:    "claude",
+		Messages: []message.Message{assistant},
+	})
+	if err != nil {
+		t.Fatalf("Stream() error = %v", err)
+	}
+	_ = stream.Close()
+	messages, _ := captured["messages"].([]any)
+	content, _ := messages[0].(map[string]any)["content"].([]any)
+	textBlock, _ := content[0].(map[string]any)
+	toolBlock, _ := content[1].(map[string]any)
+	// The marker belongs after the complete message: the trailing tool_use
+	// block carries it so the cached prefix includes the tool invocation.
+	if toolBlock["type"] != "tool_use" || toolBlock["cache_control"].(map[string]any)["type"] != "ephemeral" {
+		t.Fatalf("tool_use block = %#v, want cache_control on the trailing block", toolBlock)
+	}
+	if _, marked := textBlock["cache_control"]; marked {
+		t.Fatalf("text block = %#v, want no cache_control before the full message", textBlock)
+	}
+
+	// A tool-only assistant message must not lose the boundary entirely.
+	toolOnly := message.Message{
+		Role:          message.RoleAssistant,
+		CacheBoundary: true,
+		ToolCalls: []message.ToolCall{{
+			ID: "call_2", Name: "lookup", Arguments: json.RawMessage(`{"query":"venat"}`),
+		}},
+	}
+	stream, err = driver.Stream(context.Background(), provider.Request{
+		Model:    "claude",
+		Messages: []message.Message{toolOnly},
+	})
+	if err != nil {
+		t.Fatalf("Stream() error = %v", err)
+	}
+	_ = stream.Close()
+	messages, _ = captured["messages"].([]any)
+	content, _ = messages[0].(map[string]any)["content"].([]any)
+	toolBlock, _ = content[0].(map[string]any)
+	if toolBlock["type"] != "tool_use" || toolBlock["cache_control"].(map[string]any)["type"] != "ephemeral" {
+		t.Fatalf("tool-only block = %#v, want cache_control preserved", toolBlock)
+	}
+}
+
+func TestDriverStreamOmitsAbsentSystem(t *testing.T) {
+	var captured map[string]any
+	server := anthropicContractServer(t, &captured)
+	defer server.Close()
+	driver := New(Config{APIKey: "test", BaseURL: server.URL})
+	stream, err := driver.Stream(context.Background(), provider.Request{
+		Model:    "claude",
+		Messages: []message.Message{message.NewText(message.RoleUser, "hi")},
+	})
+	if err != nil {
+		t.Fatalf("Stream() error = %v", err)
+	}
+	_ = stream.Close()
+	// A boxed empty string defeats omitempty and Anthropic rejects empty
+	// system text: the absent case must omit the wire field entirely.
+	if system, present := captured["system"]; present {
+		t.Fatalf("system = %#v, want omitted when absent", system)
+	}
+}
+
+func TestDriverStreamRejectsUnterminatedTerminalFrame(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		writer.Header().Set("Content-Type", "text/event-stream")
+		// The message_stop JSON object is complete but the SSE frame lacks
+		// its terminating blank line: the connection died mid-frame.
+		_, _ = writer.Write([]byte("event: message_stop\ndata: {\"type\":\"message_stop\"}"))
+	}))
+	defer server.Close()
+	driver := New(Config{APIKey: "test", BaseURL: server.URL})
+	stream, err := driver.Stream(context.Background(), provider.Request{
+		Model:    "claude",
+		Messages: []message.Message{message.NewText(message.RoleUser, "hi")},
+	})
+	if err != nil {
+		t.Fatalf("Stream() error = %v", err)
+	}
+	defer func() { _ = stream.Close() }()
+	event, recvErr := stream.Recv()
+	if !errors.Is(recvErr, io.ErrUnexpectedEOF) {
+		t.Fatalf("Recv() error = %v, want io.ErrUnexpectedEOF", recvErr)
+	}
+	if event.Kind == provider.EventDone {
+		t.Fatal("an unterminated terminal frame must be rejected, not reported as completion")
+	}
+}
+
 func TestToAnthropicRequestPreservesCanonicalMultimodalContent(t *testing.T) {
 	history := []message.Message{{
 		Role: message.RoleUser,
@@ -291,10 +1028,7 @@ func TestToAnthropicRequestPreservesCanonicalMultimodalContent(t *testing.T) {
 			{Kind: message.ContentImage, Data: []byte{1, 2, 3}, MediaType: "image/png"},
 		},
 	}}
-	_, messages, err := toAnthropicRequest(history)
-	if err != nil {
-		t.Fatal(err)
-	}
+	_, messages := toAnthropicRequest(history)
 	if len(messages) != 1 || len(messages[0].Content) != 2 {
 		t.Fatalf("multimodal messages = %#v", messages)
 	}
@@ -477,17 +1211,151 @@ func TestDriverStreamSurfacesTypedError(t *testing.T) {
 	}
 	defer func() { _ = stream.Close() }()
 
-	_, err = stream.Recv()
-	if err == nil {
-		t.Fatal("Recv() expected error for mid-stream error event, got nil")
+	event, err := stream.Recv()
+	if err != nil {
+		t.Fatalf("Recv() error = %v", err)
 	}
-	if !strings.Contains(err.Error(), "overloaded_error") {
-		t.Fatalf("error = %q, want it to contain the upstream type %q", err.Error(), "overloaded_error")
+	if event.Kind != provider.EventError || event.Err == nil {
+		t.Fatalf("Recv() event = %#v, want terminal EventError", event)
 	}
-	if !strings.Contains(err.Error(), "Overloaded") {
-		t.Fatalf("error = %q, want it to contain the upstream message %q", err.Error(), "Overloaded")
+	if !strings.Contains(event.Err.Error(), "overloaded_error") {
+		t.Fatalf("error = %q, want it to contain the upstream type %q", event.Err.Error(), "overloaded_error")
 	}
-	if provider.ErrorKindOf(err) != provider.ErrorServer || !provider.IsRetryableError(err) {
-		t.Fatalf("error classification = %q retryable=%v", provider.ErrorKindOf(err), provider.IsRetryableError(err))
+	if !strings.Contains(event.Err.Error(), "Overloaded") {
+		t.Fatalf("error = %q, want it to contain the upstream message %q", event.Err.Error(), "Overloaded")
+	}
+	if provider.ErrorKindOf(event.Err) != provider.ErrorServer || !provider.IsRetryableError(event.Err) {
+		t.Fatalf("error classification = %q retryable=%v", provider.ErrorKindOf(event.Err), provider.IsRetryableError(event.Err))
+	}
+	if _, err := stream.Recv(); err != io.EOF {
+		t.Fatalf("Recv() after terminal error = %v, want io.EOF", err)
+	}
+}
+
+func TestDriverStreamReturnsUnexpectedEOFWhenMessageStopsMissing(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		writer.Header().Set("Content-Type", "text/event-stream")
+		_, _ = writer.Write([]byte("event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"partial\"}}\n\n"))
+	}))
+	defer server.Close()
+
+	driver := New(Config{APIKey: "test", BaseURL: server.URL, Client: server.Client()})
+	stream, err := driver.Stream(context.Background(), provider.Request{
+		Model:    "claude-test",
+		Messages: []message.Message{message.NewText(message.RoleUser, "hi")},
+	})
+	if err != nil {
+		t.Fatalf("Stream() error = %v", err)
+	}
+	defer func() { _ = stream.Close() }()
+	event, err := stream.Recv()
+	if err != nil || event.Text != "partial" {
+		t.Fatalf("first Recv() = %#v, %v; want partial event", event, err)
+	}
+	if _, err := stream.Recv(); err != io.ErrUnexpectedEOF {
+		t.Fatalf("second Recv() error = %v, want io.ErrUnexpectedEOF", err)
+	}
+}
+
+func TestDriverStreamReturnsUnexpectedEOFForEmptyStream(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		writer.Header().Set("Content-Type", "text/event-stream")
+	}))
+	defer server.Close()
+
+	driver := New(Config{APIKey: "test", BaseURL: server.URL, Client: server.Client()})
+	stream, err := driver.Stream(context.Background(), provider.Request{
+		Model:    "claude-test",
+		Messages: []message.Message{message.NewText(message.RoleUser, "hi")},
+	})
+	if err != nil {
+		t.Fatalf("Stream() error = %v", err)
+	}
+	defer func() { _ = stream.Close() }()
+	if _, err := stream.Recv(); err != io.ErrUnexpectedEOF {
+		t.Fatalf("Recv() error = %v, want io.ErrUnexpectedEOF", err)
+	}
+}
+
+func TestDriverStreamRejectsMalformedJSON(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		writer.Header().Set("Content-Type", "text/event-stream")
+		_, _ = writer.Write([]byte("event: message_start\ndata: {not-json}\n\n"))
+	}))
+	defer server.Close()
+
+	driver := New(Config{APIKey: "test", BaseURL: server.URL, Client: server.Client()})
+	stream, err := driver.Stream(context.Background(), provider.Request{
+		Model:    "claude-test",
+		Messages: []message.Message{message.NewText(message.RoleUser, "hi")},
+	})
+	if err != nil {
+		t.Fatalf("Stream() error = %v", err)
+	}
+	defer func() { _ = stream.Close() }()
+	if _, err := stream.Recv(); err == nil || !strings.Contains(err.Error(), "invalid character") {
+		t.Fatalf("Recv() error = %v, want malformed JSON error", err)
+	}
+}
+
+func TestDriverStreamProviderStateRoundTrip(t *testing.T) {
+	var calls int
+	var replayed requestBody
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		calls++
+		writer.Header().Set("Content-Type", "text/event-stream")
+		if calls == 1 {
+			_, _ = writer.Write([]byte("event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg-state\",\"model\":\"claude-test\",\"usage\":{\"input_tokens\":2}}}\n\n"))
+			_, _ = writer.Write([]byte("event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n"))
+			_, _ = writer.Write([]byte("event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"answer\"}}\n\n"))
+			_, _ = writer.Write([]byte("event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"citations_delta\",\"citation\":{\"type\":\"char_location\",\"cited_text\":\"source\"}}}\n\n"))
+			_, _ = writer.Write([]byte("event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":1}}\n\n"))
+			_, _ = writer.Write([]byte("event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"))
+			return
+		}
+		if err := json.NewDecoder(request.Body).Decode(&replayed); err != nil {
+			t.Fatalf("decode replay request: %v", err)
+		}
+		_, _ = writer.Write([]byte("event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"))
+	}))
+	defer server.Close()
+
+	driver := New(Config{APIKey: "test", BaseURL: server.URL, Client: server.Client()})
+	first, err := driver.Stream(context.Background(), provider.Request{
+		Model:    "claude-test",
+		Messages: []message.Message{message.NewText(message.RoleUser, "hi")},
+	})
+	if err != nil {
+		t.Fatalf("first Stream() error = %v", err)
+	}
+	firstEvents := collectAnthropicEvents(t, first)
+	if len(firstEvents) == 0 || firstEvents[len(firstEvents)-1].Kind != provider.EventDone {
+		t.Fatalf("first events = %#v", firstEvents)
+	}
+	state := firstEvents[len(firstEvents)-1].ProviderState
+	if len(state) == 0 || !strings.Contains(string(state), `"message"`) ||
+		!strings.Contains(string(state), `"citations"`) {
+		t.Fatalf("provider state = %s, want message and citation state", state)
+	}
+
+	second, err := driver.Stream(context.Background(), provider.Request{
+		Model: "claude-test",
+		Messages: []message.Message{
+			message.NewText(message.RoleUser, "hi"),
+			{Role: message.RoleAssistant, ProviderState: state},
+			message.NewText(message.RoleUser, "next"),
+		},
+	})
+	if err != nil {
+		t.Fatalf("second Stream() error = %v", err)
+	}
+	defer func() { _ = second.Close() }()
+	if _, err := second.Recv(); err != nil {
+		t.Fatalf("second Recv() error = %v", err)
+	}
+	if len(replayed.Messages) != 3 || len(replayed.Messages[1].Content) != 1 ||
+		replayed.Messages[1].Content[0].Text != "answer" ||
+		len(replayed.Messages[1].Content[0].Citations) != 1 {
+		t.Fatalf("replayed assistant content = %#v", replayed.Messages)
 	}
 }

@@ -24,6 +24,7 @@ type responsesRequest struct {
 	Tools             []responsesTool     `json:"tools,omitempty"`
 	Stream            bool                `json:"stream"`
 	Store             bool                `json:"store"`
+	Metadata          map[string]string   `json:"metadata,omitempty"`
 	PromptCacheKey    string              `json:"prompt_cache_key,omitempty"`
 	ServiceTier       string              `json:"service_tier,omitempty"`
 	ParallelToolCalls *bool               `json:"parallel_tool_calls,omitempty"`
@@ -107,15 +108,17 @@ type responsesOutputState struct {
 }
 
 type responsesStream struct {
-	body     io.ReadCloser
-	reader   *shared.Reader
-	items    map[int]*responsesOutputState
-	finished bool
+	body                 io.ReadCloser
+	reader               *shared.Reader
+	items                map[int]*responsesOutputState
+	contextUsage         provider.ContextUsageObserver
+	contextUsageReported bool
+	finished             bool
 }
 
 func (d Driver) streamResponses(ctx context.Context, request provider.Request) (provider.Stream, error) {
 	if len(request.StopSequences) > 0 {
-		return nil, fmt.Errorf("openai responses API does not support stop sequences")
+		shared.WarnDrop("openai responses", "stopSequences", "does not support stop sequences")
 	}
 	apiKey, err := d.apiKey()
 	if err != nil {
@@ -125,6 +128,7 @@ func (d Driver) streamResponses(ctx context.Context, request provider.Request) (
 	if err != nil {
 		return nil, err
 	}
+	text := responsesTextFromRequest(request.ResponseFormat)
 	body, err := marshalResponsesRequest(responsesRequest{
 		Model:             request.Model,
 		Temperature:       request.Temperature,
@@ -133,11 +137,12 @@ func (d Driver) streamResponses(ctx context.Context, request provider.Request) (
 		Input:             input,
 		Tools:             toResponsesTools(request.Tools),
 		Stream:            true,
+		Metadata:          request.Metadata,
 		PromptCacheKey:    request.PromptCacheKey,
 		ServiceTier:       request.ServiceTier,
 		ParallelToolCalls: request.ParallelToolCalls,
 		Reasoning:         responsesReasoningFromBudget(request.ThinkingBudget),
-		Text:              responsesTextFromRequest(request.ResponseFormat),
+		Text:              text,
 	}, request.ExtraBody)
 	if err != nil {
 		return nil, err
@@ -147,9 +152,10 @@ func (d Driver) streamResponses(ctx context.Context, request provider.Request) (
 		return nil, err
 	}
 	return &responsesStream{
-		body:   bodyStream,
-		reader: shared.NewReader(bodyStream),
-		items:  make(map[int]*responsesOutputState),
+		body:         bodyStream,
+		reader:       shared.NewReader(bodyStream),
+		items:        make(map[int]*responsesOutputState),
+		contextUsage: request.ContextUsage,
 	}, nil
 }
 
@@ -209,15 +215,23 @@ func mergeResponsesBodyObject(merged map[string]json.RawMessage, extraBody map[s
 			return fmt.Errorf("decode openai responses managed body field %q: %w", key, err)
 		}
 	}
+	droppedProtected := map[string]struct{}{}
 	for _, protectedKey := range protectedKeys {
 		if _, managed := current[protectedKey]; !managed {
 			continue
 		}
 		if _, supplied := extra[protectedKey]; supplied {
-			return fmt.Errorf("openai responses ExtraBody %s.%s conflicts with a managed request field", key, protectedKey)
+			if key != "reasoning" {
+				return fmt.Errorf("openai responses ExtraBody %s.%s conflicts with a managed request field", key, protectedKey)
+			}
+			shared.WarnDrop("openai responses", "extraBody", "reasoning.effort conflicts with a managed request field")
+			droppedProtected[protectedKey] = struct{}{}
 		}
 	}
 	for field, fieldValue := range extra {
+		if _, dropped := droppedProtected[field]; dropped {
+			continue
+		}
 		current[field] = fieldValue
 	}
 	encodedCurrent, err := json.Marshal(current)
@@ -271,6 +285,7 @@ var managedResponsesBodyFields = map[string]struct{}{
 	"stream":               {},
 	"reasoning":            {},
 	"text":                 {},
+	"metadata":             {},
 	"instructions":         {},
 	"previous_response_id": {},
 	"conversation":         {},
@@ -306,19 +321,21 @@ func toResponsesInput(messages []message.Message) ([]json.RawMessage, error) {
 }
 
 func appendResponsesAssistantInput(items []json.RawMessage, msg message.Message) ([]json.RawMessage, error) {
-	if msg.CacheBoundary && len(msg.ProviderState) > 0 {
-		return nil, fmt.Errorf("openai responses cache boundary cannot annotate opaque provider state")
+	cacheBoundary := msg.CacheBoundary
+	if cacheBoundary && len(msg.ProviderState) > 0 {
+		shared.WarnDrop("openai responses", "cacheBoundary", "cannot annotate opaque provider state")
+		cacheBoundary = false
 	}
 	if len(msg.ProviderState) > 0 {
 		stateItems, err := decodeResponsesProviderState(msg.ProviderState)
-		if err != nil {
-			return nil, err
+		if err == nil {
+			return append(items, stateItems...), nil
 		}
-		return append(items, stateItems...), nil
+		shared.WarnDrop("openai responses", "providerState", strings.TrimPrefix(err.Error(), "openai responses "))
 	}
 	var err error
-	if len(msg.CanonicalContent()) > 0 || msg.CacheBoundary {
-		items, err = appendResponsesTextMessage(items, message.RoleAssistant, msg.CanonicalContent(), msg.CacheBoundary)
+	if len(msg.CanonicalContent()) > 0 || cacheBoundary {
+		items, err = appendResponsesTextMessage(items, message.RoleAssistant, msg.CanonicalContent(), cacheBoundary)
 		if err != nil {
 			return nil, err
 		}
@@ -358,59 +375,12 @@ func responsesMessageContent(parts []message.ContentPart, role message.Role, cac
 	textOnly := true
 	var plain strings.Builder
 	for _, part := range parts {
-		switch part.Kind {
-		case message.ContentText, message.ContentCommentary, message.ContentFinalAnswer:
-			plain.WriteString(part.Text)
-			blocks = append(blocks, map[string]any{"type": "input_text", "text": part.Text})
-		case message.ContentReasoning, message.ContentRedactedReasoning:
-			return nil, fmt.Errorf(
-				"openai responses requires opaque ProviderState to replay %s content for role %s",
-				part.Kind,
-				role,
-			)
-		case message.ContentImage:
-			if role != message.RoleUser {
-				return nil, fmt.Errorf("openai responses image content requires user role")
-			}
-			url, err := contentPartURL(part)
-			if err != nil {
-				return nil, err
-			}
-			textOnly = false
-			blocks = append(blocks, map[string]any{"type": "input_image", "image_url": url})
-		case message.ContentAudio:
-			if role != message.RoleUser || len(part.Data) == 0 {
-				return nil, fmt.Errorf("openai responses audio content requires user-role inline data")
-			}
-			textOnly = false
-			blocks = append(blocks, map[string]any{
-				"type": "input_audio",
-				"input_audio": map[string]any{
-					"data":   base64.StdEncoding.EncodeToString(part.Data),
-					"format": audioFormat(part),
-				},
-			})
-		case message.ContentFile:
-			if role != message.RoleUser {
-				return nil, fmt.Errorf("openai responses file content requires user role")
-			}
-			file, err := chatFilePart(part)
-			if err != nil {
-				return nil, err
-			}
-			textOnly = false
-			block := map[string]any{"type": "input_file", "filename": file.Filename}
-			if file.FileData != "" {
-				block["file_data"] = file.FileData
-			} else {
-				block["file_id"] = file.FileID
-			}
-			blocks = append(blocks, block)
-		case message.ContentSource, message.ContentProviderData:
-			return nil, fmt.Errorf("openai responses cannot serialize %s content", part.Kind)
-		default:
-			return nil, fmt.Errorf("openai responses received unknown content kind %q", part.Kind)
+		block, keepText, ok := responsesContentBlock(part, role, &plain)
+		if !ok {
+			continue
 		}
+		textOnly = textOnly && keepText
+		blocks = append(blocks, block)
 	}
 	if cacheBoundary {
 		for index := len(blocks) - 1; index >= 0; index-- {
@@ -419,7 +389,7 @@ func responsesMessageContent(parts []message.ContentPart, role message.Role, cac
 				return blocks, nil
 			}
 		}
-		return nil, fmt.Errorf("openai responses cache boundary requires non-empty text")
+		shared.WarnDrop("openai responses", "cacheBoundary", "requires non-empty text")
 	}
 	if textOnly {
 		return plain.String(), nil
@@ -427,15 +397,76 @@ func responsesMessageContent(parts []message.ContentPart, role message.Role, cac
 	return blocks, nil
 }
 
+// responsesContentBlock maps one content part onto a responses input block.
+// keepText reports whether the part belongs to the plain-text fast path; ok
+// is false when the part was dropped with a warning.
+func responsesContentBlock(part message.ContentPart, role message.Role, plain *strings.Builder) (block map[string]any, keepText bool, ok bool) {
+	switch part.Kind {
+	case message.ContentText, message.ContentCommentary, message.ContentFinalAnswer:
+		plain.WriteString(part.Text)
+		return map[string]any{"type": "input_text", "text": part.Text}, true, true
+	case message.ContentReasoning, message.ContentRedactedReasoning:
+		shared.WarnDrop("openai responses", "content", "requires opaque ProviderState to replay reasoning content")
+	case message.ContentImage:
+		if role != message.RoleUser {
+			shared.WarnDrop("openai responses", "content", "image content requires user role")
+			return nil, false, false
+		}
+		url, err := contentPartURL(part)
+		if err != nil {
+			shared.WarnDrop("openai responses", "content", err.Error())
+			return nil, false, false
+		}
+		return map[string]any{"type": "input_image", "image_url": url}, false, true
+	case message.ContentAudio:
+		if role != message.RoleUser || len(part.Data) == 0 {
+			shared.WarnDrop("openai responses", "content", "audio content requires user-role inline data")
+			return nil, false, false
+		}
+		return map[string]any{
+			"type": "input_audio",
+			"input_audio": map[string]any{
+				"data":   base64.StdEncoding.EncodeToString(part.Data),
+				"format": audioFormat(part),
+			},
+		}, false, true
+	case message.ContentFile:
+		if role != message.RoleUser {
+			shared.WarnDrop("openai responses", "content", "file content requires user role")
+			return nil, false, false
+		}
+		file, err := chatFilePart(part)
+		if err != nil {
+			shared.WarnDrop("openai responses", "content", err.Error())
+			return nil, false, false
+		}
+		block := map[string]any{"type": "input_file", "filename": file.Filename}
+		if file.FileData != "" {
+			block["file_data"] = file.FileData
+		} else {
+			block["file_id"] = file.FileID
+		}
+		return block, false, true
+	case message.ContentSource:
+		shared.WarnDrop("openai responses", "content", "cannot serialize source content")
+	case message.ContentProviderData:
+		shared.WarnDrop("openai responses", "content", "cannot serialize provider_data content")
+	default:
+		shared.WarnDrop("openai responses", "content", fmt.Sprintf("unknown content kind %q dropped", part.Kind))
+	}
+	return nil, false, false
+}
+
 func appendResponsesToolOutput(items []json.RawMessage, result *message.ToolResult, cacheBoundary bool) ([]json.RawMessage, error) {
 	if result == nil {
 		if cacheBoundary {
-			return nil, fmt.Errorf("openai responses cache boundary requires a tool result")
+			shared.WarnDrop("openai responses", "cacheBoundary", "requires a tool result")
 		}
 		return items, nil
 	}
 	if cacheBoundary && result.TextContent() == "" {
-		return nil, fmt.Errorf("openai responses cache boundary requires non-empty tool result text")
+		shared.WarnDrop("openai responses", "cacheBoundary", "requires non-empty tool result text")
+		cacheBoundary = false
 	}
 	output, err := responsesMessageContent(result.CanonicalContent(), message.RoleTool, cacheBoundary)
 	if err != nil {
@@ -490,20 +521,31 @@ func responsesReasoningFromBudget(budget int) *responsesReasoning {
 }
 
 func responsesTextFromRequest(format *provider.ResponseFormat) *responsesText {
-	if format == nil || format.Type == "" {
+	if format == nil {
 		return nil
 	}
-	payload := map[string]any{"type": format.Type}
-	if format.Type == "json_schema" {
-		payload["name"] = format.Name
-		payload["strict"] = format.Strict
+	switch format.Type {
+	case "text", "json_object":
+		return &responsesText{Format: map[string]any{"type": format.Type}}
+	case "json_schema":
+		payload := map[string]any{
+			"type":   format.Type,
+			"name":   format.Name,
+			"strict": format.Strict,
+		}
 		if len(format.RawSchema) > 0 {
 			payload["schema"] = format.RawSchema
 		} else if format.Schema != nil {
 			payload["schema"] = format.Schema
+		} else {
+			shared.WarnDrop("openai responses", "responseFormat", "requires schema")
+			return nil
 		}
+		return &responsesText{Format: payload}
+	default:
+		shared.WarnDrop("openai responses", "responseFormat", fmt.Sprintf("unsupported response format type %q", format.Type))
+		return nil
 	}
-	return &responsesText{Format: payload}
 }
 
 func (s *responsesStream) Recv() (provider.Event, error) {
@@ -542,6 +584,11 @@ func (s *responsesStream) consume(event responsesStreamEvent) (provider.Event, b
 	switch event.Type {
 	case "response.output_item.added":
 		s.recordOutputItem(event.OutputIndex, event.Item)
+	case "response.output_text.annotation.added", "response.output_text.logprobs", "response.output_audio.delta":
+		// Citations, logprobs, and audio are provider-specific metadata. The
+		// terminal response output is retained verbatim in ProviderState, so
+		// these events must be consumed without flattening or dropping them.
+		return provider.Event{}, false, nil
 	case "response.output_text.delta", "response.refusal.delta":
 		return provider.Event{
 			Kind:      provider.EventTextDelta,
@@ -564,7 +611,11 @@ func (s *responsesStream) consume(event responsesStreamEvent) (provider.Event, b
 			},
 		}, true, nil
 	case "response.output_item.done":
-		return s.outputItemDone(event.OutputIndex, event.Item), event.Item.Type == "function_call" && !s.outputState(event.OutputIndex).hadArgumentDeltas, nil
+		// Hosted tool items (web_search_call, code_interpreter_call,
+		// file_search_call) are executed by the provider inside the response;
+		// they stay in ProviderState and never become local tool calls.
+		result := s.outputItemDone(event.OutputIndex, event.Item)
+		return result, result.Kind == provider.EventToolCallDelta, nil
 	case "response.completed":
 		return s.completed(event.Response)
 	case "response.incomplete":
@@ -609,11 +660,14 @@ func (s *responsesStream) completed(response responsesResponse) (provider.Event,
 	}
 	stopReason := provider.StopReasonComplete
 	for _, item := range output {
+		// Only function_call requires local dispatch. Hosted tool items were
+		// already executed by the provider within this response.
 		if item.Type == "function_call" {
 			stopReason = provider.StopReasonToolUse
 			break
 		}
 	}
+	s.reportContextUsage(response.Usage.InputTokens)
 	s.finished = true
 	return responsesDoneEvent(response, stopReason, providerState), true, nil
 }
@@ -632,8 +686,17 @@ func (s *responsesStream) incomplete(response responsesResponse) (provider.Event
 			stopReason = provider.StopReasonContentFilter
 		}
 	}
+	s.reportContextUsage(response.Usage.InputTokens)
 	s.finished = true
 	return responsesDoneEvent(response, stopReason, providerState), true, nil
+}
+
+func (s *responsesStream) reportContextUsage(inputTokens int) {
+	if s.contextUsage == nil || s.contextUsageReported {
+		return
+	}
+	s.contextUsageReported = true
+	s.contextUsage(provider.ContextUsage{UsedTokens: inputTokens})
 }
 
 func responsesOutput(raw json.RawMessage) (json.RawMessage, []responsesOutputItem, error) {
