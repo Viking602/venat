@@ -407,6 +407,12 @@ func (s *anthropicStream) Recv() (provider.Event, error) {
 		}
 		var parsed eventEnvelope
 		if err := json.Unmarshal([]byte(current.Data), &parsed); err != nil {
+			if truncated {
+				// Partial JSON from a cut connection: surface the truncation
+				// error, not a decode error, so OpenRetryingStream can
+				// classify the failure as retryable.
+				return provider.Event{}, io.ErrUnexpectedEOF
+			}
 			return provider.Event{}, err
 		}
 		event, emit, err := s.consume(parsed)
@@ -837,8 +843,15 @@ func anthropicSystemText(parts []message.ContentPart) string {
 }
 
 func markAnthropicCacheBoundary(blocks []contentBlock) {
+	// The marker belongs after the complete message so the cached prefix
+	// covers trailing tool_use blocks too, not just the text before them.
+	// Thinking blocks are skipped: they cannot carry cache_control.
 	for index := len(blocks) - 1; index >= 0; index-- {
-		if blocks[index].Type == "text" && blocks[index].Text != "" {
+		block := blocks[index]
+		cacheable := block.Type == "tool_use" || block.Type == "tool_result" ||
+			block.Type == "image" || block.Type == "document" ||
+			(block.Type == "text" && block.Text != "")
+		if cacheable {
 			blocks[index].CacheControl = &cacheControl{Type: "ephemeral"}
 			return
 		}

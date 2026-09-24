@@ -890,6 +890,90 @@ func TestDriverStreamReportsContextUsageOnce(t *testing.T) {
 	_ = stream.Close()
 }
 
+func TestDriverStreamPreservesTruncationOverDecodeError(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		writer.Header().Set("Content-Type", "text/event-stream")
+		// Cut mid-JSON: the partial frame must surface the truncation error
+		// (retryable) instead of a json.SyntaxError (not retryable).
+		_, _ = writer.Write([]byte("event: content_block_delta\ndata: {\"type\":\"content_blo"))
+	}))
+	defer server.Close()
+	driver := New(Config{APIKey: "test", BaseURL: server.URL})
+	stream, err := driver.Stream(context.Background(), provider.Request{
+		Model:    "claude",
+		Messages: []message.Message{message.NewText(message.RoleUser, "hi")},
+	})
+	if err != nil {
+		t.Fatalf("Stream() error = %v", err)
+	}
+	defer func() { _ = stream.Close() }()
+	_, recvErr := stream.Recv()
+	if !errors.Is(recvErr, io.ErrUnexpectedEOF) {
+		t.Fatalf("Recv() error = %v, want io.ErrUnexpectedEOF (retryable), not a decode error", recvErr)
+	}
+	if provider.IsRetryableError(recvErr) != true {
+		t.Fatalf("Recv() error = %v, want retryable per OpenRetryingStream policy", recvErr)
+	}
+}
+
+func TestDriverStreamCacheBoundaryCoversToolUse(t *testing.T) {
+	var captured map[string]any
+	server := anthropicContractServer(t, &captured)
+	defer server.Close()
+	driver := New(Config{APIKey: "test", BaseURL: server.URL})
+	assistant := message.Message{
+		Role:          message.RoleAssistant,
+		Text:          "working",
+		CacheBoundary: true,
+		ToolCalls: []message.ToolCall{{
+			ID: "call_1", Name: "lookup", Arguments: json.RawMessage(`{"query":"venat"}`),
+		}},
+	}
+	stream, err := driver.Stream(context.Background(), provider.Request{
+		Model:    "claude",
+		Messages: []message.Message{assistant},
+	})
+	if err != nil {
+		t.Fatalf("Stream() error = %v", err)
+	}
+	_ = stream.Close()
+	messages, _ := captured["messages"].([]any)
+	content, _ := messages[0].(map[string]any)["content"].([]any)
+	textBlock, _ := content[0].(map[string]any)
+	toolBlock, _ := content[1].(map[string]any)
+	// The marker belongs after the complete message: the trailing tool_use
+	// block carries it so the cached prefix includes the tool invocation.
+	if toolBlock["type"] != "tool_use" || toolBlock["cache_control"].(map[string]any)["type"] != "ephemeral" {
+		t.Fatalf("tool_use block = %#v, want cache_control on the trailing block", toolBlock)
+	}
+	if _, marked := textBlock["cache_control"]; marked {
+		t.Fatalf("text block = %#v, want no cache_control before the full message", textBlock)
+	}
+
+	// A tool-only assistant message must not lose the boundary entirely.
+	toolOnly := message.Message{
+		Role:          message.RoleAssistant,
+		CacheBoundary: true,
+		ToolCalls: []message.ToolCall{{
+			ID: "call_2", Name: "lookup", Arguments: json.RawMessage(`{"query":"venat"}`),
+		}},
+	}
+	stream, err = driver.Stream(context.Background(), provider.Request{
+		Model:    "claude",
+		Messages: []message.Message{toolOnly},
+	})
+	if err != nil {
+		t.Fatalf("Stream() error = %v", err)
+	}
+	_ = stream.Close()
+	messages, _ = captured["messages"].([]any)
+	content, _ = messages[0].(map[string]any)["content"].([]any)
+	toolBlock, _ = content[0].(map[string]any)
+	if toolBlock["type"] != "tool_use" || toolBlock["cache_control"].(map[string]any)["type"] != "ephemeral" {
+		t.Fatalf("tool-only block = %#v, want cache_control preserved", toolBlock)
+	}
+}
+
 func TestDriverStreamOmitsAbsentSystem(t *testing.T) {
 	var captured map[string]any
 	server := anthropicContractServer(t, &captured)
