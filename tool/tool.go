@@ -9,6 +9,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"unicode"
 
 	"github.com/Viking602/venat/message"
 )
@@ -395,7 +396,7 @@ func (b *Bus) Execute(ctx context.Context, call Call, options ExecuteOptions) (R
 	limiter := b.limiters[key]
 	b.mu.RUnlock()
 	if !ok {
-		return rejectedCall(call, fmt.Errorf("%w: %s; choose an available tool", ErrToolNotFound, call.Name)), nil
+		return rejectedCall(call, fmt.Errorf("%w: %s; choose an available tool (%s)", ErrToolNotFound, call.Name, b.availableToolsHint(call.Name))), nil
 	}
 	if validation.err != nil {
 		return Result{}, validation.err
@@ -420,6 +421,163 @@ func (b *Bus) Execute(ctx context.Context, call Call, options ExecuteOptions) (R
 		return terminal.Execute(ctx, cloneCall(call), options.Sink)
 	}
 	return interceptor.Execute(ctx, terminal, call, options.Sink)
+}
+
+// availableToolsHint builds the unknown-name rejection hint. Candidates are
+// ranked by nameSimilarity so the tool the model likely meant surfaces first,
+// and strong matches are called out as a "did you mean" suggestion. Only
+// dispatchable names are disclosed: restricted or unregistered tools are never
+// named because the model cannot reach them on this bus.
+func (b *Bus) availableToolsHint(query string) string {
+	b.mu.RLock()
+	candidates := make([]Definition, 0, len(b.definitions))
+	for _, definition := range b.definitions {
+		candidates = append(candidates, definition)
+	}
+	b.mu.RUnlock()
+	if len(candidates) == 0 {
+		return "no tools are registered"
+	}
+	sort.Slice(candidates, func(i, j int) bool {
+		left, right := nameSimilarity(query, candidates[i]), nameSimilarity(query, candidates[j])
+		if left != right {
+			return left > right
+		}
+		return candidates[i].Name < candidates[j].Name
+	})
+	names := make([]string, 0, len(candidates))
+	for _, candidate := range candidates {
+		names = append(names, candidate.Name)
+	}
+	const maxNamed = 12
+	list := names
+	if len(list) > maxNamed {
+		list = list[:maxNamed]
+	}
+	hint := "available: " + strings.Join(list, ", ")
+	if len(names) > maxNamed {
+		hint += fmt.Sprintf(", and %d more", len(names)-maxNamed)
+	}
+	if top := nameSimilarity(query, candidates[0]); top >= didYouMeanThreshold {
+		suggested := make([]string, 0, maxSuggestions)
+		for _, candidate := range candidates {
+			if len(suggested) == maxSuggestions || nameSimilarity(query, candidate) < top-0.05 {
+				break
+			}
+			suggested = append(suggested, candidate.Name)
+		}
+		hint = fmt.Sprintf("did you mean: %s? %s", strings.Join(suggested, ", "), hint)
+	}
+	return hint
+}
+
+const (
+	didYouMeanThreshold = 0.3
+	maxSuggestions      = 3
+)
+
+// nameSimilarity scores how likely definition is the tool a rejected call
+// meant to reach. It is a deterministic heuristic over names and descriptions,
+// never a rewrite decision. Containment catches vendor-prior names with
+// affixes (agent_update_plan -> update_plan), edit distance catches typos and
+// renames, and token overlap with the description catches training vocabulary
+// the model still reaches for (apply_patch -> edit_file whose description
+// names that tool family).
+func nameSimilarity(query string, definition Definition) float64 {
+	normalizedQuery, normalizedName := normalizeName(query), normalizeName(definition.Name)
+	if normalizedQuery == "" || normalizedName == "" {
+		return 0
+	}
+	longest := max(len(normalizedQuery), len(normalizedName))
+	score := 1 - float64(levenshtein(normalizedQuery, normalizedName))/float64(longest)
+	if strings.Contains(normalizedQuery, normalizedName) || strings.Contains(normalizedName, normalizedQuery) {
+		score = max(score, 0.8+0.2*float64(min(len(normalizedQuery), len(normalizedName)))/float64(longest))
+	}
+	queryTokens := nameTokens(query)
+	score = max(score, tokenOverlap(queryTokens, nameTokens(definition.Name)))
+	score = max(score, 0.7*tokenOverlap(queryTokens, nameTokens(definition.Description)))
+	return score
+}
+
+// normalizeName lowercases value and strips separators so agentUpdatePlan and
+// agent_update_plan compare as the same symbol.
+func normalizeName(value string) string {
+	normalized := make([]rune, 0, len(value))
+	for _, current := range strings.ToLower(value) {
+		if unicode.IsLetter(current) || unicode.IsDigit(current) {
+			normalized = append(normalized, current)
+		}
+	}
+	return string(normalized)
+}
+
+// nameTokens splits an identifier or description into lowercase words on
+// snake_case, kebab-case, and camelCase boundaries.
+func nameTokens(value string) []string {
+	var tokens []string
+	var current []rune
+	runes := []rune(value)
+	flush := func() {
+		if len(current) >= 2 {
+			tokens = append(tokens, strings.ToLower(string(current)))
+		}
+		current = current[:0]
+	}
+	for index, letter := range runes {
+		if !unicode.IsLetter(letter) && !unicode.IsDigit(letter) {
+			flush()
+			continue
+		}
+		if unicode.IsUpper(letter) && index > 0 {
+			previous := runes[index-1]
+			if unicode.IsLower(previous) || unicode.IsDigit(previous) {
+				flush()
+			}
+		}
+		current = append(current, letter)
+	}
+	flush()
+	return tokens
+}
+
+// tokenOverlap reports the fraction of query tokens present in candidate.
+func tokenOverlap(queryTokens, candidate []string) float64 {
+	if len(queryTokens) == 0 {
+		return 0
+	}
+	known := make(map[string]struct{}, len(candidate))
+	for _, token := range candidate {
+		known[token] = struct{}{}
+	}
+	matched := 0
+	for _, token := range queryTokens {
+		if _, ok := known[token]; ok {
+			matched++
+		}
+	}
+	return float64(matched) / float64(len(queryTokens))
+}
+
+// levenshtein returns the edit distance between left and right in runes.
+func levenshtein(left, right string) int {
+	leftRunes, rightRunes := []rune(left), []rune(right)
+	previous := make([]int, len(rightRunes)+1)
+	current := make([]int, len(rightRunes)+1)
+	for index := range previous {
+		previous[index] = index
+	}
+	for i := 1; i <= len(leftRunes); i++ {
+		current[0] = i
+		for j := 1; j <= len(rightRunes); j++ {
+			cost := 1
+			if leftRunes[i-1] == rightRunes[j-1] {
+				cost = 0
+			}
+			current[j] = min(min(current[j-1]+1, previous[j]+1), previous[j-1]+cost)
+		}
+		previous, current = current, previous
+	}
+	return previous[len(rightRunes)]
 }
 
 func rejectedCall(call Call, err error) Result {
