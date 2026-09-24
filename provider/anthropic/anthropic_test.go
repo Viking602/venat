@@ -346,6 +346,41 @@ func TestDriverStreamDropsMalformedAnthropicProviderState(t *testing.T) {
 	}
 }
 
+func TestDriverStreamRejectsForeignArrayProviderState(t *testing.T) {
+	var captured map[string]any
+	server := anthropicContractServer(t, &captured)
+	defer server.Close()
+	recorder := &anthropicTestLogRecorder{}
+	previous := slog.Default()
+	slog.SetDefault(slog.New(recorder))
+	defer slog.SetDefault(previous)
+
+	driver := New(Config{APIKey: "test", BaseURL: server.URL})
+	// OpenAI Responses provider state is also a JSON array; a model fallback
+	// to Anthropic must not replay those items as Anthropic content blocks.
+	stream, err := driver.Stream(context.Background(), provider.Request{
+		Model: "claude",
+		Messages: []message.Message{{
+			Role: message.RoleAssistant,
+			Text: "fallback",
+			ProviderState: json.RawMessage(
+				`[{"type":"message","id":"msg_1","role":"assistant","content":[{"type":"output_text","text":"hi"}]},{"type":"function_call","call_id":"call_1","name":"lookup","arguments":"{}"}]`),
+		}},
+	})
+	if err != nil {
+		t.Fatalf("Stream() error = %v", err)
+	}
+	_ = stream.Close()
+	messages, _ := captured["messages"].([]any)
+	content := messages[0].(map[string]any)["content"].([]any)
+	if len(content) != 1 || content[0].(map[string]any)["text"] != "fallback" {
+		t.Fatalf("fallback content = %#v, want plain text replay", content)
+	}
+	if !recorder.has("providerState", "decode anthropic provider state") {
+		t.Fatalf("missing provider state warning: %#v", recorder.records)
+	}
+}
+
 func TestToAnthropicRequestEmptyToolInput(t *testing.T) {
 	history := []message.Message{
 		{Role: message.RoleAssistant, ToolCalls: []message.ToolCall{{ID: "x", Name: "noop"}}},

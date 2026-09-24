@@ -462,6 +462,24 @@ func (s *anthropicStream) consume(parsed eventEnvelope) (provider.Event, bool, e
 	return provider.Event{}, false, nil
 }
 
+// validateAnthropicBlocks rejects state that is not Anthropic content blocks.
+// Other providers encode their replay state as JSON arrays too (OpenAI
+// Responses items such as {"type":"message"} or {"type":"function_call"}),
+// and a foreign array unmarshals into contentBlock without error, so a
+// cross-provider fallback would silently replay garbage. Only block types
+// this driver produces are accepted.
+func validateAnthropicBlocks(blocks []contentBlock) error {
+	for _, block := range blocks {
+		switch block.Type {
+		case "text", "tool_use", "tool_result", "thinking", "redacted_thinking",
+			"image", "document", "web_search_tool_result":
+		default:
+			return fmt.Errorf("decode anthropic provider state: unsupported content block type %q", block.Type)
+		}
+	}
+	return nil
+}
+
 func (s *anthropicStream) recordMessageStart(parsed eventEnvelope) error {
 	s.state.message = append(s.state.message[:0], parsed.Message...)
 	// Real message_start events nest input/cache usage under message.usage;
@@ -644,6 +662,9 @@ func decodeAnthropicProviderState(raw json.RawMessage) ([]contentBlock, error) {
 		if err := json.Unmarshal(trimmed, &blocks); err != nil {
 			return nil, fmt.Errorf("decode anthropic provider state: %w", err)
 		}
+		if err := validateAnthropicBlocks(blocks); err != nil {
+			return nil, err
+		}
 		return blocks, nil
 	}
 	if trimmed[0] != '{' {
@@ -661,6 +682,9 @@ func decodeAnthropicProviderState(raw json.RawMessage) ([]contentBlock, error) {
 	var state anthropicProviderState
 	if err := json.Unmarshal(trimmed, &state); err != nil {
 		return nil, fmt.Errorf("decode anthropic provider state: %w", err)
+	}
+	if err := validateAnthropicBlocks(state.Content); err != nil {
+		return nil, err
 	}
 	return state.Content, nil
 }
