@@ -1225,7 +1225,7 @@ func TestResponsesInputPreservesCanonicalMultimodalContent(t *testing.T) {
 	}
 }
 
-func TestResponsesStreamEmitsBuiltInToolCallDeltas(t *testing.T) {
+func TestResponsesStreamKeepsBuiltInToolCallsInProviderState(t *testing.T) {
 	stream := newResponsesTestStream(`data: {"type":"response.output_item.added","output_index":0,"item":{"id":"ws_1","type":"web_search_call","status":"in_progress","action":{"type":"search","query":"venat"}}}
 
 data: {"type":"response.output_item.done","output_index":0,"item":{"id":"ws_1","type":"web_search_call","status":"completed","action":{"type":"search","query":"venat"}}}
@@ -1242,30 +1242,50 @@ data: {"type":"response.completed","response":{"output":[{"id":"ws_1","type":"we
 
 `)
 	events := collectEvents(t, stream)
-	if len(events) != 4 {
-		t.Fatalf("events = %#v, want three built-in tool deltas and done", events)
+	// Hosted tools are executed by the provider inside the response. Emitting
+	// tool-call deltas would route them through the local tool.Bus as unknown
+	// tools; they must stay in ProviderState instead.
+	if len(events) != 1 || events[0].Kind != provider.EventDone {
+		t.Fatalf("events = %#v, want terminal done only", events)
 	}
-	for index, want := range []struct {
-		id, name, marker string
-	}{
-		{id: "ws_1", name: responsesWebSearchCall, marker: `"query":"venat"`},
-		{id: "ci_1", name: responsesCodeInterpreter, marker: `"code":"print(1)"`},
-		{id: "fs_1", name: responsesFileSearchCall, marker: `"queries":["venat"]`},
-	} {
-		event := events[index]
-		if event.Kind != provider.EventToolCallDelta || event.ToolCallDelta == nil {
-			t.Fatalf("built-in event %d = %#v, want tool delta", index, event)
-		}
-		delta := event.ToolCallDelta
-		if delta.ID != want.id || delta.Name != want.name || !strings.Contains(delta.ArgumentsDelta, want.marker) {
-			t.Fatalf("built-in delta %d = %#v, want %s/%s containing %q", index, delta, want.id, want.name, want.marker)
-		}
-		if delta.Index == nil || *delta.Index != index {
-			t.Fatalf("built-in delta index = %#v, want %d", delta.Index, index)
+	if events[0].StopReason != provider.StopReasonComplete {
+		t.Fatalf("terminal event = %#v, want complete (no local dispatch)", events[0])
+	}
+	state := string(events[0].ProviderState)
+	for _, marker := range []string{"web_search_call", "code_interpreter_call", "file_search_call", `"query":"venat"`, `"code":"print(1)"`, `"queries":["venat"]`} {
+		if !strings.Contains(state, marker) {
+			t.Fatalf("provider state = %s, missing hosted tool payload %q", state, marker)
 		}
 	}
-	if events[3].Kind != provider.EventDone || events[3].StopReason != provider.StopReasonToolUse {
-		t.Fatalf("terminal event = %#v, want tool-use done", events[3])
+}
+
+func TestResponsesStreamKeepsDoneOnlyBuiltInToolOutOfDispatch(t *testing.T) {
+	stream := newResponsesTestStream(`data: {"type":"response.output_item.done","output_index":0,"item":{"id":"fs_4","type":"file_search_call","status":"completed","queries":["opaque"]}}
+
+data: {"type":"response.output_item.added","output_index":1,"item":{"id":"fc_1","type":"function_call","call_id":"call_1","name":"lookup","arguments":""}}
+
+data: {"type":"response.function_call_arguments.delta","output_index":1,"delta":"{\"query\":\"venat\"}"}
+
+data: {"type":"response.output_item.done","output_index":1,"item":{"id":"fc_1","type":"function_call","call_id":"call_1","name":"lookup","arguments":"{\"query\":\"venat\"}"}}
+
+data: {"type":"response.completed","response":{"output":[{"id":"fs_4","type":"file_search_call","status":"completed","queries":["opaque"]},{"id":"fc_1","type":"function_call","call_id":"call_1","name":"lookup","arguments":"{\"query\":\"venat\"}"}],"usage":{}}}
+
+`)
+	events := collectEvents(t, stream)
+	// Only the local function_call may surface as a dispatchable delta; the
+	// done-only hosted tool yields nothing.
+	if len(events) != 2 || events[0].Kind != provider.EventToolCallDelta || events[1].Kind != provider.EventDone {
+		t.Fatalf("events = %#v, want one function-call delta and done", events)
+	}
+	if events[0].ToolCallDelta == nil || events[0].ToolCallDelta.ID != "call_1" || events[0].ToolCallDelta.Name != "lookup" {
+		t.Fatalf("function-call delta = %#v", events[0].ToolCallDelta)
+	}
+	if events[1].StopReason != provider.StopReasonToolUse {
+		t.Fatalf("terminal event = %#v, want tool-use for the local call", events[1])
+	}
+	state := string(events[1].ProviderState)
+	if !strings.Contains(state, "file_search_call") || !strings.Contains(state, `"queries":["opaque"]`) {
+		t.Fatalf("provider state = %s, want hosted tool preserved", state)
 	}
 }
 
@@ -1294,22 +1314,5 @@ data: {"type":"response.completed","response":{"output":[{"id":"msg_1","type":"m
 		if !strings.Contains(state, marker) {
 			t.Fatalf("provider state = %s, missing opaque metadata %q", state, marker)
 		}
-	}
-}
-
-func TestResponsesStreamEmitsBuiltInToolFromDoneEvent(t *testing.T) {
-	stream := newResponsesTestStream(`data: {"type":"response.output_item.done","output_index":4,"item":{"id":"fs_4","type":"file_search_call","status":"completed","queries":["opaque"]}}
-
-data: {"type":"response.completed","response":{"output":[{"id":"fs_4","type":"file_search_call","status":"completed","queries":["opaque"]}],"usage":{}}}
-
-`)
-	events := collectEvents(t, stream)
-	if len(events) != 2 || events[0].Kind != provider.EventToolCallDelta || events[1].Kind != provider.EventDone {
-		t.Fatalf("events = %#v, want built-in delta and done", events)
-	}
-	if events[0].ToolCallDelta == nil || events[0].ToolCallDelta.ID != "fs_4" ||
-		events[0].ToolCallDelta.Name != responsesFileSearchCall ||
-		!strings.Contains(events[0].ToolCallDelta.ArgumentsDelta, `"queries":["opaque"]`) {
-		t.Fatalf("built-in done delta = %#v", events[0].ToolCallDelta)
 	}
 }

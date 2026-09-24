@@ -60,26 +60,13 @@ type responsesStreamEvent struct {
 }
 
 type responsesOutputItem struct {
-	ID          string             `json:"id"`
-	Type        string             `json:"type"`
-	CallID      string             `json:"call_id"`
-	Name        string             `json:"name"`
-	Arguments   string             `json:"arguments"`
-	Phase       provider.TextPhase `json:"phase"`
-	Status      string             `json:"status,omitempty"`
-	Action      json.RawMessage    `json:"action,omitempty"`
-	ContainerID string             `json:"container_id,omitempty"`
-	Code        string             `json:"code,omitempty"`
-	Queries     []string           `json:"queries,omitempty"`
-	Results     json.RawMessage    `json:"results,omitempty"`
-	Outputs     json.RawMessage    `json:"outputs,omitempty"`
+	ID        string             `json:"id"`
+	Type      string             `json:"type"`
+	CallID    string             `json:"call_id"`
+	Name      string             `json:"name"`
+	Arguments string             `json:"arguments"`
+	Phase     provider.TextPhase `json:"phase"`
 }
-
-const (
-	responsesWebSearchCall   = "web_search_call"
-	responsesCodeInterpreter = "code_interpreter_call"
-	responsesFileSearchCall  = "file_search_call"
-)
 
 type responsesResponse struct {
 	ID                string                      `json:"id"`
@@ -118,7 +105,6 @@ type responsesOutputState struct {
 	callID            string
 	name              string
 	hadArgumentDeltas bool
-	hadToolCallEvent  bool
 }
 
 type responsesStream struct {
@@ -598,9 +584,6 @@ func (s *responsesStream) consume(event responsesStreamEvent) (provider.Event, b
 	switch event.Type {
 	case "response.output_item.added":
 		s.recordOutputItem(event.OutputIndex, event.Item)
-		if isResponsesBuiltInTool(event.Item.Type) {
-			return s.builtInToolDelta(event.OutputIndex, event.Item), true, nil
-		}
 	case "response.output_text.annotation.added", "response.output_text.logprobs", "response.output_audio.delta":
 		// Citations, logprobs, and audio are provider-specific metadata. The
 		// terminal response output is retained verbatim in ProviderState, so
@@ -628,13 +611,11 @@ func (s *responsesStream) consume(event responsesStreamEvent) (provider.Event, b
 			},
 		}, true, nil
 	case "response.output_item.done":
-		state := s.outputState(event.OutputIndex)
-		hadToolCallEvent := state.hadToolCallEvent
+		// Hosted tool items (web_search_call, code_interpreter_call,
+		// file_search_call) are executed by the provider inside the response;
+		// they stay in ProviderState and never become local tool calls.
 		result := s.outputItemDone(event.OutputIndex, event.Item)
-		state = s.outputState(event.OutputIndex)
-		emit := event.Item.Type == "function_call" && !state.hadArgumentDeltas
-		emit = emit || (isResponsesBuiltInTool(event.Item.Type) && !hadToolCallEvent)
-		return result, emit, nil
+		return result, result.Kind == provider.EventToolCallDelta, nil
 	case "response.completed":
 		return s.completed(event.Response)
 	case "response.incomplete":
@@ -657,57 +638,19 @@ func (s *responsesStream) outputItemDone(index int, item responsesOutputItem) pr
 	state := s.outputState(index)
 	hadArgumentDeltas := state.hadArgumentDeltas
 	s.recordOutputItem(index, item)
-	if item.Type == "function_call" {
-		if hadArgumentDeltas {
-			return provider.Event{}
-		}
-		indexCopy := index
-		return provider.Event{
-			Kind: provider.EventToolCallDelta,
-			ToolCallDelta: &provider.ToolCallDelta{
-				Index:          &indexCopy,
-				ID:             state.callID,
-				Name:           state.name,
-				ArgumentsDelta: item.Arguments,
-			},
-		}
+	if item.Type != "function_call" || hadArgumentDeltas {
+		return provider.Event{}
 	}
-	if isResponsesBuiltInTool(item.Type) {
-		return s.builtInToolDelta(index, item)
-	}
-	return provider.Event{}
-}
-
-func (s *responsesStream) builtInToolDelta(index int, item responsesOutputItem) provider.Event {
-	state := s.outputState(index)
-	state.hadToolCallEvent = true
 	indexCopy := index
 	return provider.Event{
 		Kind: provider.EventToolCallDelta,
 		ToolCallDelta: &provider.ToolCallDelta{
 			Index:          &indexCopy,
-			ID:             item.ID,
-			Name:           item.Type,
-			ArgumentsDelta: responsesBuiltInToolArguments(item),
+			ID:             state.callID,
+			Name:           state.name,
+			ArgumentsDelta: item.Arguments,
 		},
 	}
-}
-
-func isResponsesBuiltInTool(toolType string) bool {
-	switch toolType {
-	case responsesWebSearchCall, responsesCodeInterpreter, responsesFileSearchCall:
-		return true
-	default:
-		return false
-	}
-}
-
-func responsesBuiltInToolArguments(item responsesOutputItem) string {
-	raw, err := json.Marshal(item)
-	if err != nil {
-		return ""
-	}
-	return string(raw)
 }
 
 func (s *responsesStream) completed(response responsesResponse) (provider.Event, bool, error) {
@@ -717,7 +660,9 @@ func (s *responsesStream) completed(response responsesResponse) (provider.Event,
 	}
 	stopReason := provider.StopReasonComplete
 	for _, item := range output {
-		if item.Type == "function_call" || isResponsesBuiltInTool(item.Type) {
+		// Only function_call requires local dispatch. Hosted tool items were
+		// already executed by the provider within this response.
+		if item.Type == "function_call" {
 			stopReason = provider.StopReasonToolUse
 			break
 		}
