@@ -97,6 +97,15 @@ type anthropicContentSource struct {
 	URL       string `json:"url,omitempty"`
 }
 
+// anthropicUsage is the wire usage shape: message_start nests it under
+// message.usage; message_delta carries it at event level (output_tokens).
+type anthropicUsage struct {
+	InputTokens              int  `json:"input_tokens"`
+	CacheReadInputTokens     *int `json:"cache_read_input_tokens"`
+	CacheCreationInputTokens *int `json:"cache_creation_input_tokens"`
+	OutputTokens             int  `json:"output_tokens"`
+}
+
 type anthropicTool struct {
 	Name        string             `json:"name"`
 	Description string             `json:"description,omitempty"`
@@ -125,12 +134,7 @@ type eventEnvelope struct {
 		StopReason  string          `json:"stop_reason"`
 		Citation    json.RawMessage `json:"citation"`
 	} `json:"delta"`
-	Usage struct {
-		InputTokens              int  `json:"input_tokens"`
-		CacheReadInputTokens     *int `json:"cache_read_input_tokens"`
-		CacheCreationInputTokens *int `json:"cache_creation_input_tokens"`
-		OutputTokens             int  `json:"output_tokens"`
-	} `json:"usage"`
+	Usage anthropicUsage `json:"usage"`
 	// Error carries a mid-stream API error (overload, content policy,
 	// invalid request that passed the initial 200). Anthropic's SSE error
 	// event shape is {"type":"error","error":{"type":"...","message":"..."}}.
@@ -454,18 +458,22 @@ func (s *anthropicStream) consume(parsed eventEnvelope) (provider.Event, bool, e
 
 func (s *anthropicStream) recordMessageStart(parsed eventEnvelope) error {
 	s.state.message = append(s.state.message[:0], parsed.Message...)
+	// Real message_start events nest input/cache usage under message.usage;
+	// the event-level usage object is absent there and only appears on
+	// message_delta (output_tokens).
 	var metadata struct {
-		ID    string `json:"id"`
-		Model string `json:"model"`
+		ID    string         `json:"id"`
+		Model string         `json:"model"`
+		Usage anthropicUsage `json:"usage"`
 	}
 	if len(parsed.Message) > 0 {
 		if err := json.Unmarshal(parsed.Message, &metadata); err != nil {
 			return fmt.Errorf("decode anthropic message_start: %w", err)
 		}
 	}
-	cacheReadTokens, cacheReadReported := optionalToken(parsed.Usage.CacheReadInputTokens)
-	cacheWriteTokens, cacheWriteReported := optionalToken(parsed.Usage.CacheCreationInputTokens)
-	s.state.usage.InputTokens = parsed.Usage.InputTokens + cacheReadTokens + cacheWriteTokens
+	cacheReadTokens, cacheReadReported := optionalToken(metadata.Usage.CacheReadInputTokens)
+	cacheWriteTokens, cacheWriteReported := optionalToken(metadata.Usage.CacheCreationInputTokens)
+	s.state.usage.InputTokens = metadata.Usage.InputTokens + cacheReadTokens + cacheWriteTokens
 	s.state.usage.CachedInputTokens = cacheReadTokens
 	s.state.usage.CachedInputTokensReported = cacheReadReported
 	s.state.usage.CacheWriteInputTokens = cacheWriteTokens

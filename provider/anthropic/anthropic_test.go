@@ -83,7 +83,7 @@ func TestDriverStreamParsesMessageSSE(t *testing.T) {
 			t.Fatalf("unexpected path %s", request.URL.Path)
 		}
 		writer.Header().Set("Content-Type", "text/event-stream")
-		_, _ = writer.Write([]byte("event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg-1\",\"model\":\"claude-test\"},\"usage\":{\"input_tokens\":3,\"cache_read_input_tokens\":2,\"cache_creation_input_tokens\":1}}\n\n"))
+		_, _ = writer.Write([]byte("event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg-1\",\"model\":\"claude-test\",\"usage\":{\"input_tokens\":3,\"cache_read_input_tokens\":2,\"cache_creation_input_tokens\":1}}}\n\n"))
 		_, _ = writer.Write([]byte("event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Hello \"}}\n\n"))
 		_, _ = writer.Write([]byte("event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_1\",\"name\":\"lookup\",\"input\":{}}}\n\n"))
 		_, _ = writer.Write([]byte("event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"query\\\":\\\"ve\"}}\n\n"))
@@ -291,6 +291,7 @@ func TestToAnthropicRequestDropsUnsignedThinking(t *testing.T) {
 		t.Fatalf("missing unsigned thinking warning: %#v", recorder.records)
 	}
 }
+
 func TestToAnthropicRequestDropsLateSignedThinking(t *testing.T) {
 	recorder := &anthropicTestLogRecorder{}
 	previous := slog.Default()
@@ -371,7 +372,7 @@ func anthropicContractServer(t *testing.T, captured *map[string]any) *httptest.S
 	return httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		_ = json.NewDecoder(request.Body).Decode(captured)
 		writer.Header().Set("Content-Type", "text/event-stream")
-		_, _ = writer.Write([]byte("event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"model\":\"claude\"},\"usage\":{\"input_tokens\":7,\"cache_read_input_tokens\":2,\"cache_creation_input_tokens\":1}}\n\n"))
+		_, _ = writer.Write([]byte("event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"model\":\"claude\",\"usage\":{\"input_tokens\":7,\"cache_read_input_tokens\":2,\"cache_creation_input_tokens\":1}}}\n\n"))
 		_, _ = writer.Write([]byte("event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"))
 	}))
 }
@@ -1138,7 +1139,7 @@ func TestDriverStreamProviderStateRoundTrip(t *testing.T) {
 		calls++
 		writer.Header().Set("Content-Type", "text/event-stream")
 		if calls == 1 {
-			_, _ = writer.Write([]byte("event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg-state\",\"model\":\"claude-test\"},\"usage\":{\"input_tokens\":2}}\n\n"))
+			_, _ = writer.Write([]byte("event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg-state\",\"model\":\"claude-test\",\"usage\":{\"input_tokens\":2}}}\n\n"))
 			_, _ = writer.Write([]byte("event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n"))
 			_, _ = writer.Write([]byte("event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"answer\"}}\n\n"))
 			_, _ = writer.Write([]byte("event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"citations_delta\",\"citation\":{\"type\":\"char_location\",\"cited_text\":\"source\"}}}\n\n"))

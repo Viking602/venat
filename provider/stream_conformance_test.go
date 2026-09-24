@@ -487,14 +487,14 @@ func anthropicTextFixture(keepalive bool) string {
 	if keepalive {
 		prefix = ": keepalive\n\n"
 	}
-	return prefix + `event: message_start` + "\n" + `data: {"type":"message_start","message":{"id":"msg-1","model":"conformance-model"},"usage":{"input_tokens":4}}` + "\n\n" +
+	return prefix + `event: message_start` + "\n" + `data: {"type":"message_start","message":{"id":"msg-1","model":"conformance-model","usage":{"input_tokens":4}}}` + "\n\n" +
 		`event: content_block_delta` + "\n" + `data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hello"}}` + "\n\n" +
 		`event: message_delta` + "\n" + `data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":3}}` + "\n\n" +
 		`event: message_stop` + "\n" + `data: {"type":"message_stop"}` + "\n\n"
 }
 
 func anthropicThinkingTextFixture() string {
-	return `event: message_start` + "\n" + `data: {"type":"message_start","message":{"id":"msg-1","model":"conformance-model"},"usage":{"input_tokens":4}}` + "\n\n" +
+	return `event: message_start` + "\n" + `data: {"type":"message_start","message":{"id":"msg-1","model":"conformance-model","usage":{"input_tokens":4}}}` + "\n\n" +
 		`event: content_block_delta` + "\n" + `data: {"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"reasoning"}}` + "\n\n" +
 		`event: content_block_delta` + "\n" + `data: {"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"hello"}}` + "\n\n" +
 		`event: message_delta` + "\n" + `data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":3}}` + "\n\n" +
@@ -502,7 +502,7 @@ func anthropicThinkingTextFixture() string {
 }
 
 func anthropicToolFixture() string {
-	return `event: message_start` + "\n" + `data: {"type":"message_start","message":{"id":"msg-1","model":"conformance-model"},"usage":{"input_tokens":4}}` + "\n\n" +
+	return `event: message_start` + "\n" + `data: {"type":"message_start","message":{"id":"msg-1","model":"conformance-model","usage":{"input_tokens":4}}}` + "\n\n" +
 		`event: content_block_start` + "\n" + `data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"call-1","name":"lookup"}}` + "\n\n" +
 		`event: content_block_delta` + "\n" + `data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"query\":\"venat\"}"}}` + "\n\n" +
 		`event: message_delta` + "\n" + `data: {"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":3}}` + "\n\n" +
@@ -510,7 +510,7 @@ func anthropicToolFixture() string {
 }
 
 func anthropicMixedFixture() string {
-	return `event: message_start` + "\n" + `data: {"type":"message_start","message":{"id":"msg-1","model":"conformance-model"},"usage":{"input_tokens":4}}` + "\n\n" +
+	return `event: message_start` + "\n" + `data: {"type":"message_start","message":{"id":"msg-1","model":"conformance-model","usage":{"input_tokens":4}}}` + "\n\n" +
 		`event: content_block_delta` + "\n" + `data: {"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"reasoning"}}` + "\n\n" +
 		`event: content_block_delta` + "\n" + `data: {"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"hello"}}` + "\n\n" +
 		`event: content_block_start` + "\n" + `data: {"type":"content_block_start","index":2,"content_block":{"type":"tool_use","id":"call-1","name":"lookup"}}` + "\n\n" +
