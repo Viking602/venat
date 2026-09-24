@@ -3,6 +3,7 @@ package anthropic
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"net/http"
@@ -852,6 +853,52 @@ func TestDriverStreamReportsContextUsageOnce(t *testing.T) {
 		}
 	}
 	_ = stream.Close()
+}
+
+func TestDriverStreamOmitsAbsentSystem(t *testing.T) {
+	var captured map[string]any
+	server := anthropicContractServer(t, &captured)
+	defer server.Close()
+	driver := New(Config{APIKey: "test", BaseURL: server.URL})
+	stream, err := driver.Stream(context.Background(), provider.Request{
+		Model:    "claude",
+		Messages: []message.Message{message.NewText(message.RoleUser, "hi")},
+	})
+	if err != nil {
+		t.Fatalf("Stream() error = %v", err)
+	}
+	_ = stream.Close()
+	// A boxed empty string defeats omitempty and Anthropic rejects empty
+	// system text: the absent case must omit the wire field entirely.
+	if system, present := captured["system"]; present {
+		t.Fatalf("system = %#v, want omitted when absent", system)
+	}
+}
+
+func TestDriverStreamRejectsUnterminatedTerminalFrame(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		writer.Header().Set("Content-Type", "text/event-stream")
+		// The message_stop JSON object is complete but the SSE frame lacks
+		// its terminating blank line: the connection died mid-frame.
+		_, _ = writer.Write([]byte("event: message_stop\ndata: {\"type\":\"message_stop\"}"))
+	}))
+	defer server.Close()
+	driver := New(Config{APIKey: "test", BaseURL: server.URL})
+	stream, err := driver.Stream(context.Background(), provider.Request{
+		Model:    "claude",
+		Messages: []message.Message{message.NewText(message.RoleUser, "hi")},
+	})
+	if err != nil {
+		t.Fatalf("Stream() error = %v", err)
+	}
+	defer func() { _ = stream.Close() }()
+	event, recvErr := stream.Recv()
+	if !errors.Is(recvErr, io.ErrUnexpectedEOF) {
+		t.Fatalf("Recv() error = %v, want io.ErrUnexpectedEOF", recvErr)
+	}
+	if event.Kind == provider.EventDone {
+		t.Fatal("an unterminated terminal frame must be rejected, not reported as completion")
+	}
 }
 
 func TestToAnthropicRequestPreservesCanonicalMultimodalContent(t *testing.T) {

@@ -414,6 +414,12 @@ func (s *anthropicStream) Recv() (provider.Event, error) {
 			return provider.Event{}, err
 		}
 		if emit {
+			if truncated {
+				// The frame carrying the terminal event arrived unterminated:
+				// its completion cannot be trusted, so the stream is rejected
+				// as truncated instead of reporting success (ADR-030).
+				return provider.Event{}, io.ErrUnexpectedEOF
+			}
 			return event, nil
 		}
 		if truncated {
@@ -735,7 +741,13 @@ func (a *systemAssembler) result() any {
 	if a.hasBoundary {
 		return a.blocks
 	}
-	return strings.Join(a.parts, "\n\n")
+	joined := strings.Join(a.parts, "\n\n")
+	if joined == "" {
+		// An absent system must stay nil: a boxed empty string defeats
+		// omitempty and Anthropic rejects empty system text.
+		return nil
+	}
+	return joined
 }
 
 func toAnthropicRequest(messages []message.Message) (any, []anthropicMessage) {
