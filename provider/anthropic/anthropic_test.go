@@ -1359,3 +1359,9 @@ func TestDriverStreamProviderStateRoundTrip(t *testing.T) {
 		t.Fatalf("replayed assistant content = %#v", replayed.Messages)
 	}
 }
+
+func TestMapAnthropicStopReasonPauseTurn(t *testing.T) {
+	if got := mapAnthropicStopReason("pause_turn"); got != provider.StopReasonPause {
+		t.Fatalf("pause_turn stop reason = %q, want %q", got, provider.StopReasonPause)
+	}
+}

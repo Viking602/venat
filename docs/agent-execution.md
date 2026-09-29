@@ -80,7 +80,8 @@ used. The model chooses the next action within the existing budget.
 | Completed response with invalid tool JSON, empty final text or length cutoff | Up to three corrective model turns; no tool from the rejected response executes |
 | Process exit, ordinary launch rejection, or oversized logs | Behavior described above |
 | Parent cancellation/deadline, execution budget, explicit step-policy stop | Stop according to the existing execution contract |
-| Provider open/stream error, missing/conflicting identities or terminal protocol violations | Preserve the Go error; no blind model/effect retry |
+| Recognized provider context-length rejection | Shrink configured context and retry a bounded number of times; retain the original error if recovery fails |
+| Other provider open/stream errors, missing/conflicting identities or terminal protocol violations | Preserve the Go error; no blind model/effect retry |
 | HTTP transport/read failure, process I/O/resource failure | Preserve the Go error and unknown-effect handling |
 | Hook/interceptor/sink/checkpoint failure, panic, invalid static configuration | Stop; do not conceal infrastructure or extension failures as business feedback |
 | Irreducible context or structured-output repair exhaustion | Preserve the existing typed Agent failure |
@@ -181,8 +182,129 @@ context fitting disabled. `ContextBuilderFunc` uses this default fitting because
 its Compact method is a no-op. Existing custom `Compact`/`CompactTo` semantics remain;
 they must preserve complete exchanges, protected context, and newly queued input.
 
-No model-generated summary is produced. Transcript storage still grows with the
-execution; archiving and cross-execution memory remain application concerns.
+The default fitter does not produce a model-generated summary. Enable working
+memory below to retain semantic task state instead of only dropping old groups.
+
+## Model-backed working memory
+
+```go
+memory, err := agent.NewWorkingMemory(agent.WorkingMemoryConfig{
+    Provider: summaryProvider,
+    Model: summaryModel,
+    SystemInstructions: "Complete the requested work and retain its evidence.",
+    RecentTurns: 2,
+    SummaryMaxTokens: 4096,
+})
+if err != nil {
+    return err
+}
+engine.WorkingMemory = memory
+engine.LoopPolicy.ContextTokenTarget = 64000
+```
+
+WorkingMemory summarizes goals, constraints, evidence, file/artifact references,
+failed attempts, and remaining work. It preserves the explicit cache prefix,
+system instructions, the latest user correction, and recent complete message/tool
+groups. A long single-user tool loop can be summarized; prior summaries can
+themselves be summarized rather than accumulating forever.
+
+Provider and model are explicit. A configured `ContextBuilder` takes precedence
+over `Engine.WorkingMemory`; WorkingMemory also implements ContextManager.
+A fitting history makes no summary request. `WorkingMemoryConfig.Observer`
+reports progress and auxiliary usage. Engine's invocation-scoped accounting
+includes summary usage in total usage, including failed summary work where the
+provider reports usage.
+
+Compaction separates transcript evidence from model context. Old complete
+exchanges are marked `ContextArchived`, not deleted from `Result.Messages` or
+continuations. `message.ContextView` and supported provider adapters omit those
+entries from model requests. This preserves step/tool identity validation while
+the model sees only the summary and retained context. Fresh queued inputs and
+active skill instructions remain visible before they can be summarized.
+
+Summary calls are auxiliary provider work, not automatically durable model
+attempts. Checkpoints retain the generated summary and its usage; interruption
+before that checkpoint can cause another summary request on resume. No
+exactly-once summary billing guarantee is implied.
+
+The fallback estimate is a text heuristic, not an exact tokenizer. Supply a
+`WorkingMemoryEstimator` for model-specific accounting and media. Reserve output
+and tool-schema space in `ContextTokenTarget`. Summary output is marked as
+untrusted context evidence, not promoted into system instructions. Empty,
+truncated, tool-calling, or failed summaries do not silently replace history.
+`examples/working-memory` exercises summary and main-model calls with combined
+usage; it is not a real-model summary-quality benchmark.
+
+## Retrievable large tool output
+
+Create an `OutputStore` with `tool.NewOutputStore(privateDirectory)` and set
+`Engine.OutputStore`. Engine registers `tool_output_read` and `tool_output_search`
+automatically, rejects conflicting registrations, and processes final output
+after tool hooks. Large text/structured bodies become previews with stable
+SHA-256 `artifact://` references. Identity, `IsError`, and media are preserved.
+
+The read tool accepts `reference`, byte `offset`, and `limit`. Search scans large
+artifacts with bounded returned evidence; its offsets support subsequent reads.
+Retrieval results are not recursively spilled. `WithPreviewThreshold`,
+`WithReadLimit`, and `WithSearchLimit` customize limits.
+
+The caller owns the private rooted local store and must call `Close`; Engine
+does not close it. Identical output reuses a stable reference. No measured
+provider cache-hit improvement is claimed. Only received output is saved: the
+process/HTTP adapters' existing capture limits still apply before the store.
+Bytes already discarded upstream cannot be recovered. Storage errors never
+produce references to nonexistent output. Run `examples/tool-output`.
+
+## Ordered parallelism and early reads
+
+`ToolMode: tool.ModeParallel` runs consecutive parallel-capable calls in groups
+separated by `ConcurrencySequential` barriers: two reads overlap, then an edit
+runs, then the next reads overlap. A failed group does not cross the next barrier.
+Per-tool/exclusive limits still apply. AgentTools share finite parent token
+capacity through short-held reservations rather than a lock covering whole child
+executions; known batches receive predetermined shares.
+
+`Engine.SafeStreamingTools` explicitly lists trusted read-only tools that may
+start before the model stream finishes; `LoopInput` has the same option.
+Adapters emit complete calls on the internal `provider.Request.CompleteToolCalls`
+path. Argument fragments are never executed. Sequential/unsafe barriers and
+hook-rewritten names constrain early work. Started calls are consumed once, not
+redispatched after streaming. Model and tool progress share a serialized sink.
+
+Enable this only for tools whose early execution is acceptable even if a later
+stream event fails. It is not permission to speculate on writes. Run
+`examples/parallel-tools` and `examples/streaming-tools` for channel-controlled
+proof of overlap.
+
+## Executable task acceptance
+
+`agent.NewToolVerifier(name, checkBus, calls)` uses the existing output guardrail:
+
+```go
+verify, err := agent.NewToolVerifier("acceptance", checks, []tool.Call{
+    {Name: "run_tests", Arguments: json.RawMessage(`{}`)},
+})
+if err != nil {
+    return err
+}
+engine.OutputGuardrails = append(engine.OutputGuardrails, verify)
+```
+
+Checks are application-selected repeatable tools, separate from model actions.
+A completed failed check returns bounded head/tail diagnostics for correction.
+Infrastructure errors and cancellation stop verification. Checks run again on
+the next proposed final assistant answer. Use read-only checks and wrap drivers
+for additional authorization or effect recording. Their work is not charged as
+model-requested tool calls.
+
+`examples/task-verification` runs a real process against a temporary configuration
+file: premature completion fails, diagnostics reach the model, a repair changes
+the file, and the check passes.
+
+`Engine.ResponseContinuation` (or its LoopInput counterpart) customizes
+output-length recovery. The default preserves requested detail instead of always
+demanding a shorter answer.
+
 
 ## Explicit Jev context scoring
 
@@ -245,11 +367,51 @@ tested. Compression quality, actual token savings, latency and live provider
 compatibility require caller credentials and a representative evaluation set;
 no authenticated Jev quality result is claimed here.
 
+## Explicit nonterminal pauses
+
+`provider.StopReasonPause` means the provider ended a response but has not finished
+the task. Anthropic `pause_turn` maps to this signal. A completed response
+containing commentary is not guessed to be a pause.
+
+Engine retains the paused assistant state and usage, records a continue step, and
+samples again without fabricating a user "continue" instruction. Final-answer
+guardrails and output validation do not run on the paused response. Tool progress
+and newly consumed input reset the consecutive-pause streak; after eight allowed
+consecutive continuations, another pause returns `ErrPauseContinuationLimit`.
+Hitting the loop ceiling while still paused is not reported as successful
+completion. Cancellation and explicit execution limits remain authoritative.
+
+Run `go run ./examples/pause-continuation` for two explicit pauses followed by a
+final answer without manual prompting.
+
 ## Input during execution
 
 Attach a fresh `&agent.Control{}` to `Engine.Control`, or to `LoopInput.Control`
 for the low-level entry point. Start the execution normally. Once running, a
 separate application goroutine can submit authorized user input:
+
+Choose the input mode deliberately:
+
+| API | Behavior |
+| --- | --- |
+| `Control.Steer` | Correct the current direction; interrupt active model sampling where safe, then continue the same execution |
+| `Control.Send` | Add information at the next safe model boundary without interrupting sampling |
+| `Control.FollowUp` | Queue a subsequent task until current work naturally finishes |
+| `Control.Cancel` | End execution; reject unconsumed receipts |
+
+For example, `control.Steer(agent.Request{Prompt: "Do not edit yet. Locate the failing path first."})`
+returns an admission result and a consumption receipt immediately. Await the
+receipt from the application goroutine, not from a tool/hook callback.
+
+Send and Steer preserve admission order so an older instruction cannot be moved
+after its correction. Steering does not kill or pretend to roll back started
+tool effects. Real completed results are retained; obsolete calls that have not
+started are skipped. If a safe streaming tool has already started, interruption
+waits for a safe boundary instead of breaking its call/result pairing.
+
+Run `go run ./examples/live-steering` for an active model stream redirected into
+a second request, without canceling the whole run.
+
 
 ```go
 ack, err := control.Send(agent.Request{Prompt: "Also check cancellation"})
@@ -276,29 +438,49 @@ must return from that callback before it can consume the input.
 The queue permits 64 outstanding inputs, 1 MiB of serialized message data per
 input, and 4 MiB total. It preserves admission order and clones input. Input is
 consumed before a model request, never in the middle of a tool exchange. Pending
-input forces a normal final answer to continue; a terminal tool, budget stop,
-explicit step-policy stop, or error still ends the execution and rejects any
-unconsumed receipts. Terminal admission and Send are synchronized. Inputs after
+input forces a natural final answer or successful terminal tool to continue.
+Budget stops, explicit step-policy stops, and errors still end execution and
+reject unconsumed receipts. Terminal admission and input submission are synchronized. Inputs after
 the terminal decision are rejected even if output validation is still finishing.
 
-`control.Cancel()` cancels the active model/tool context. Handles are single-use,
-so stale handles cannot address a subsequent execution. No application turn ID,
-agent registry, tool-result injection, or user authorization is inferred. The
-application must use Send only for authorized user input, not peer/tool messages.
+`control.Cancel()` cancels the active model/tool context. Handles are single-use.
+Use Send for authorized input. For worker results,
+`Runtime.CompletionHook(parentControl)` handles provenance labeling and
+safe-boundary retention; never present raw worker output as trusted instructions.
 
 Queued input is process-local. Acknowledged input lives in checkpoint Messages.
 A crash before acknowledgement, or a checkpoint response loss, may leave the
 caller uncertain; inspect the checkpoint rather than blindly replaying input.
 Reopen with a fresh control. No exactly-once input delivery is claimed.
 
-## Composition and remaining integration work
+## Live multi-agent collaboration
 
-Existing `orchestration.Drive` retains bounded concurrent dispatch. An application
-executor can attach one control per dispatch and route user input to the right
-execution. `NewAgentTool` remains synchronous; independently addressable child
-agents, mailboxes, follow-up scheduling, and workspace ownership remain external.
+`orchestration.Drive` retains batch/tick behavior. Use
+`orchestration.NewRuntime` for independently progressing workers:
 
-CubeSandbox/MCP adapters, interactive process sessions, a production durable
-backend, model-backed summaries, and tool retrieval are not included in this
-SDK-only delivery. Recovery tests use the existing private test backend; external
-backends must run the contract suite including process-reopen cases.
+- `Runtime.Tools()` exposes `spawn`, `inspect`, `await`, `send`, `steer`, and `cancel`.
+- Spawn returns a handle immediately; the runtime owns a worker pool and queue.
+- Send adds input at a safe boundary or continues idle-worker history.
+- `Runtime.Steer` / `TaskHandle.Steer` redirect a running worker's sampling while
+  preserving its identity and history; idle workers receive a new follow-up turn.
+  Running workers acknowledge consumption; idle workers acknowledge admission.
+- `CompletionHook(parentControl)` exposes evidence at the parent's model boundary
+  and queues it into the transcript. Without a control it is provider-view only.
+- `DrainCompletions(cursor)` reads a bounded retained journal; consumers own their
+  cursors. `ErrCompletionCursorStale` explicitly reports a cursor that fell behind
+  retention, rather than returning an incomplete success. Latest task results
+  remain available through Inspect/Await. The `Completions` channel is advisory.
+- `RequiredTasksGuardrail(runtime)` tracks dynamically spawned tasks; explicit
+  IDs restrict the set. It waits instead of burning retries, and reports failed
+  or canceled required work as an output block.
+- Close cancels and joins owned work. Its lifetime is separate from a parent's
+  current turn.
+
+The runtime is in-memory, not a persistent scheduler or workspace sandbox.
+`examples/async-agents` runs an actual parent Engine with task tools, fast-result
+consumption before a slow worker completes, retained follow-up context,
+independent cancellation, and shutdown checks.
+
+CubeSandbox/MCP adapters, interactive process sessions, and a production durable
+backend remain external. Summaries and tool-output retrieval are implemented
+above.

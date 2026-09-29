@@ -12,6 +12,11 @@ Provider-neutral values shared by model and tool boundaries:
 
 Messages preserve structured content, provider state, response metadata, tool identities, and legacy text synchronization without embedding application policy.
 
+`Message.ContextArchived` marks evidence replaced in the model context by a
+summary. `ContextView` returns the visible projection without deleting the
+transcript; its message values are borrowed and must be cloned before mutation.
+Engine and the built-in provider adapters apply the projection automatically.
+
 ## `provider`
 
 `provider.Driver` exposes `Metadata` and streaming `Stream`. A `provider.Stream` emits normalized events until a terminal `EventDone` or `EventError` and then EOF.
@@ -27,12 +32,16 @@ Important contracts:
 - `WithStreamIdleTimeout` closes an idle stream and returns `ErrStreamIdleTimeout`;
   Agent model policies also expose typed connection and total-request timeout
   errors.
+- `Request.CompleteToolCalls` requests complete tool-call events for safe early
+  execution; default fragment delivery remains unchanged.
+- `ErrorContextLength` and `IsContextOverflow` identify supported provider
+  context rejections without treating arbitrary HTTP 413 responses as token errors.
 
 Provider-specific adapters remain under `provider/<adapter>`.
 
 ## `tool`
 
-`tool.Driver` exposes a definition and executes one typed call. `tool.Bus` validates calls and dispatches sequentially or in bounded parallel mode.
+`tool.Driver` exposes a definition and executes one typed call. `tool.Bus` validates calls and dispatches sequentially or in ordered parallel groups separated by sequential barriers.
 
 Important contracts:
 
@@ -54,13 +63,20 @@ Important contracts:
 
 Function tools may accept an `UpdateSink`. Process tools emit `UpdateOutput` as stdout/stderr is read. Drivers that never invoke the sink retain one-shot behavior.
 
+`NewOutputStore` provides concrete local output artifacts. `Process` returns
+previews and stable references; `Tools` supplies range-read and streaming-search
+drivers. `Engine.OutputStore` performs automatic registration and result
+processing. The caller closes the store. Invalid references, unsafe paths, and
+storage failures are not hidden behind successful-looking previews.
+
+
 ## `skill`
 
 `skill.Skill`, registry, discovery, and resource APIs load reusable instructions. Skills contribute context only. They do not grant tools, create identities, schedule peers, or start another execution loop.
 
 ## `agent`
 
-`agent.Engine` owns one bounded Agent loop.
+`agent.Engine` owns the model/tool execution loop.
 
 Construct an Engine directly for explicit wiring, or use `Spec` with `Build` and
 `BuildDeps`. `Build` resolves the provider and optional fallback model, selects
@@ -120,6 +136,35 @@ adds bounded live user input and cancellation to a single execution. See
 [execution behavior and examples](agent-execution.md) for acknowledgement,
 context, compatibility, and recovery limits.
 
+Live interaction has three distinct modes: `Control.Send` appends information at
+the next safe boundary; `Control.Steer` interrupts model sampling where safe and
+continues with a direction correction; `Control.FollowUp` waits for natural
+completion of current work. All return admission errors plus consumption receipts.
+`Runtime.Steer` and `TaskHandle.Steer` provide the corresponding worker operation.
+Started tool effects are not rolled back or automatically replayed.
+
+`provider.StopReasonPause` is an explicit nonterminal response, including
+Anthropic `pause_turn`. It preserves state/usage and continues before completion
+checks. Exhausted pause continuation produces `ErrPauseContinuationLimit`, never
+a successful final answer. Commentary text alone does not imply a pause.
+
+
+Long-task runtime options:
+
+- `WorkingMemory`: a concrete model-backed manager from `NewWorkingMemory`.
+  Explicit `ContextBuilder` overrides this convenience field.
+- `OutputStore`: local large-output storage and automatic read/search tools.
+- `SafeStreamingTools`: explicitly trusted read-only tool names allowed to
+  overlap with a complete-call model stream.
+- `ResponseContinuation`: an optional output-length continuation instruction.
+- `NewToolVerifier`: executable checks through the existing `OutputGuardrail`
+  contract, with observed failure feedback driving another model turn.
+
+See [Agent execution](agent-execution.md) for setup, ownership, and runnable
+examples. Summary usage is included in Engine usage; summary quality and
+provider cache-hit gains require real-model evaluation.
+
+
 `AgentToolConfig` and `NewAgentTool` expose an already configured child
 `Engine` as a non-terminal `tool.Driver`.
 
@@ -142,9 +187,9 @@ func NewAgentTool(child Engine, config AgentToolConfig) (tool.Driver, error)
   update-sink failures remain Go errors after usage settlement.
 - Child frames emit progress-only updates without thinking, tool arguments, or
   child result payloads.
-- Recursive usage enters the parent budget once. A bounded parent's AgentTool
-  calls serialize against one token pool; unbounded parents retain Tool
-  Definition concurrency.
+- Recursive usage enters the parent budget once. Finite-budget child calls use
+  short-held reservations and predetermined batch shares; a reservation is not
+  a mutex held for the child's whole execution. Unused capacity is returned.
 
 Extension seams:
 
@@ -156,9 +201,16 @@ Extension seams:
 - `Sink` for transient output
 - context managers and skills
 
-`FrameToolUpdate` carries a deep-copied tool update. Normal turn order is provider tool-call/done frames, zero or more tool-update frames, the final tool-result frame, then the next model turn. The accumulator, messages, steps, and continuations ignore tool updates; only the final result enters history.
+`FrameToolUpdate` carries a deep-copied tool update. Normally tool updates/results follow the provider tool-call/done frames. With safe streaming enabled, updates can overlap remaining model events through a serialized sink. Only final tool results enter history; transient progress is not a second transcript.
 
 A `Continuation` records the complete provider-neutral state at one of four phases: `ready`, `model_complete`, `tools_complete`, or `validating_output`. `ValidateContinuation` rejects missing, contradictory, reordered, or malformed state rather than repairing it.
+
+`Continuation.ContextUsage` and cumulative `Step.ContextUsage` snapshots identify
+auxiliary context-model usage separately from main-model calls. Total usage
+includes both; ready-boundary resume restores the auxiliary counters without
+counting a summary twice. Zero auxiliary fields remain omitted from canonical
+encoding, preserving existing fixture bytes.
+
 
 ## `orchestration`
 
@@ -173,6 +225,18 @@ A `Continuation` records the complete provider-neutral state at one of four phas
 - source-labeled serialized output frames
 
 Agent failures remain `Result` data. The `error` return is reserved for infrastructure failure.
+
+`NewRuntime` adds in-memory live collaboration without changing Drive's tick
+contract. A Runtime owns task goroutines and supports Spawn, Inspect, Await,
+SendFollowup, Cancel, and Close. Its model-callable Tools expose the same actions.
+`CompletionHook(parentControl)` labels worker evidence and queues it into parent
+history at safe boundaries and tracks consumption receipts. Each
+`DrainCompletions` consumer owns a cursor into a bounded retained journal;
+`ErrCompletionCursorStale` reports lag explicitly. Latest task results remain
+available through Inspect/Await. `Completions` is advisory, and independent
+waiters use broadcast state changes rather than competing for its messages.
+`RequiredTasksGuardrail` waits for required work before accepting a final answer.
+
 
 ## `durable`
 

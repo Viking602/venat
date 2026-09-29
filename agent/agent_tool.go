@@ -560,16 +560,18 @@ func reportAgentToolUsage(ctx context.Context, usage provider.Usage) {
 type agentToolReservationContextKey struct{}
 
 type agentToolTokenTracker struct {
-	gate chan struct{}
-
-	mu        sync.Mutex
-	remaining int64
+	mu         sync.Mutex
+	remaining  int64
+	active     int
+	notify     chan struct{}
+	batchSize  int
+	batchShare int64
 }
 
 func newAgentToolTokenTracker(remaining int64) *agentToolTokenTracker {
 	return &agentToolTokenTracker{
-		gate:      make(chan struct{}, 1),
 		remaining: max(int64(0), remaining),
+		notify:    make(chan struct{}),
 	}
 }
 
@@ -578,38 +580,79 @@ func agentToolReservationTrackerFromContext(ctx context.Context) *agentToolToken
 	return tracker
 }
 
-func (tracker *agentToolTokenTracker) reserve(ctx context.Context, name string, base *Budget) (*agentToolTokenReservation, *Budget, error) {
-	select {
-	case tracker.gate <- struct{}{}:
-	case <-ctx.Done():
-		return nil, nil, errors.Join(tool.ErrNotExecuted, ctx.Err())
+// prepareAgentToolBatch records the number of eligible child tools in the
+// current dispatch so default child budgets receive a predetermined share.
+func prepareAgentToolBatch(ctx context.Context, bus *tool.Bus, calls []tool.Call) {
+	tracker := agentToolReservationTrackerFromContext(ctx)
+	if tracker == nil || bus == nil {
+		return
 	}
-	if err := ctx.Err(); err != nil {
-		<-tracker.gate
-		return nil, nil, errors.Join(tool.ErrNotExecuted, err)
+	eligible := 0
+	for _, call := range calls {
+		driver, ok := bus.Driver(call.Name)
+		if !ok {
+			continue
+		}
+		if _, ok := driver.(*agentTool); ok {
+			eligible++
+		}
 	}
-
+	tracker.prepareBatch(eligible)
+}
+func (tracker *agentToolTokenTracker) prepareBatch(size int) {
+	if size < 1 {
+		return
+	}
 	tracker.mu.Lock()
-	remaining := tracker.remaining
-	if remaining <= 0 {
-		tracker.mu.Unlock()
-		<-tracker.gate
-		return nil, nil, agentToolParentBudgetExhaustedError{name: name}
+	if size > tracker.batchSize {
+		tracker.batchSize = size
+		tracker.batchShare = (tracker.remaining + int64(size) - 1) / int64(size)
 	}
+	tracker.mu.Unlock()
+}
+
+func (tracker *agentToolTokenTracker) reserve(ctx context.Context, name string, base *Budget) (*agentToolTokenReservation, *Budget, error) {
 	budget := cloneBudget(base)
 	if budget == nil {
 		budget = &Budget{}
 	}
-	claim := remaining
-	if budget.MaxTokens > 0 && budget.MaxTokens < claim {
-		claim = budget.MaxTokens
-	}
-	tracker.remaining -= claim
-	tracker.mu.Unlock()
+	requested := budget.MaxTokens
 
-	budget.MaxTokens = claim
-	reservation := &agentToolTokenReservation{tracker: tracker, claim: claim}
-	return reservation, budget, nil
+	for {
+		if err := ctx.Err(); err != nil {
+			return nil, nil, errors.Join(tool.ErrNotExecuted, err)
+		}
+		tracker.mu.Lock()
+		if tracker.remaining <= 0 {
+			if tracker.active == 0 {
+				tracker.mu.Unlock()
+				return nil, nil, agentToolParentBudgetExhaustedError{name: name}
+			}
+			notify := tracker.notify
+			tracker.mu.Unlock()
+			select {
+			case <-notify:
+				continue
+			case <-ctx.Done():
+				return nil, nil, errors.Join(tool.ErrNotExecuted, ctx.Err())
+			}
+		}
+
+		claim := tracker.remaining
+		share := tracker.batchShare
+		if share > 0 {
+			claim = min(claim, share)
+		}
+		if requested > 0 && requested < claim {
+			claim = requested
+		}
+		tracker.remaining -= claim
+		tracker.active++
+		tracker.mu.Unlock()
+
+		budget.MaxTokens = claim
+		return &agentToolTokenReservation{tracker: tracker, claim: claim}, budget, nil
+	}
 }
 
 type agentToolTokenReservation struct {
@@ -627,8 +670,11 @@ func (reservation *agentToolTokenReservation) settle(usage provider.Usage) {
 		spent := min(reservation.claim, int64(normalized.TotalTokens))
 		reservation.tracker.mu.Lock()
 		reservation.tracker.remaining += reservation.claim - spent
+		reservation.tracker.active--
+		notify := reservation.tracker.notify
+		reservation.tracker.notify = make(chan struct{})
 		reservation.tracker.mu.Unlock()
-		<-reservation.tracker.gate
+		close(notify)
 	})
 }
 

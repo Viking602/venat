@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"fmt"
+	"slices"
 	"time"
 
 	"github.com/Viking602/venat/message"
@@ -86,6 +87,8 @@ func (e Engine) resume(ctx context.Context, continuation Continuation, sink Sink
 		ServiceTier:          e.ServiceTier,
 		ParallelToolCalls:    cloneBoolPointer(e.ParallelToolCalls),
 		ContextUsage:         e.ContextUsage,
+		SafeStreamingTools:   slices.Clone(e.SafeStreamingTools),
+		ResponseContinuation: e.ResponseContinuation,
 		OutputGuardrails:     e.OutputGuardrails,
 		OutputObserver:       e.OutputObserver,
 		Sink:                 sink,
@@ -101,9 +104,12 @@ func (e Engine) resume(ctx context.Context, continuation Continuation, sink Sink
 		activeElapsed:        continuation.ActiveElapsed,
 		segmentStarted:       started,
 		initialUsage:         continuation.Usage,
+		initialContextUsage:  continuation.ContextUsage,
 		initialSteps:         cloneSteps(continuation.Steps),
 		initialToolCallsUsed: continuation.ToolCallsUsed,
 	}
+	contextUsage := continuation.ContextUsage
+	input.contextUsage = &contextUsage
 
 	if err := runCtx.Err(); err != nil {
 		return resultWithFailure(runCtx, continuationResult(continuation), err, budgetDriven)
@@ -167,6 +173,7 @@ func (e Engine) resumeModelComplete(ctx context.Context, input LoopInput, contin
 	}
 	input.Messages = messages
 	input.initialUsage = usage
+	input.initialContextUsage = *input.contextUsage
 	input.initialSteps = steps
 	input.initialToolCallsUsed = toolCallsUsed
 	return e.RunMessages(ctx, input)
@@ -202,6 +209,7 @@ func (e Engine) resumeValidatingOutput(ctx context.Context, input LoopInput, con
 	}
 	input.Messages = current
 	input.initialUsage = continuation.Usage
+	input.initialContextUsage = *input.contextUsage
 	input.initialSteps = finalizedSteps
 	input.initialToolCallsUsed = continuation.ToolCallsUsed
 	return e.RunMessages(ctx, input)

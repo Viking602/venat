@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"strings"
 	"syscall"
 	"time"
 
@@ -20,6 +21,7 @@ type StopReason string
 const (
 	StopReasonUnknown       StopReason = "unknown"
 	StopReasonComplete      StopReason = "complete"
+	StopReasonPause         StopReason = "pause"
 	StopReasonToolUse       StopReason = "tool_use"
 	StopReasonLength        StopReason = "length"
 	StopReasonContentFilter StopReason = "content_filter"
@@ -133,7 +135,11 @@ type Request struct {
 	PromptCacheKey    string                   `json:"promptCacheKey,omitempty"`
 	ServiceTier       string                   `json:"serviceTier,omitempty"`
 	ParallelToolCalls *bool                    `json:"parallelToolCalls,omitempty"`
-	ContextUsage      ContextUsageObserver     `json:"-"`
+	// CompleteToolCalls asks adapters to emit a complete EventToolCall once a
+	// tool call's arguments are fully received, before EventDone. The default
+	// remains delta-only for compatibility.
+	CompleteToolCalls bool                 `json:"-"`
+	ContextUsage      ContextUsageObserver `json:"-"`
 	// ExtraBody contains provider wire fields, not process objects.
 	// godoc-allow-any
 	ExtraBody map[string]any `json:"extraBody,omitempty"`
@@ -247,10 +253,14 @@ const (
 	ErrorAuthentication ErrorKind = "authentication"
 	ErrorPermission     ErrorKind = "permission"
 	ErrorInvalidRequest ErrorKind = "invalid_request"
-	ErrorNotFound       ErrorKind = "not_found"
-	ErrorRateLimit      ErrorKind = "rate_limit"
-	ErrorServer         ErrorKind = "server"
-	ErrorStream         ErrorKind = "stream"
+	// ErrorContextLength is emitted only for provider wire errors that
+	// explicitly identify a context-length failure. HTTP status alone is not
+	// sufficient: some gateways use 413 for unrelated payload limits.
+	ErrorContextLength ErrorKind = "context_length"
+	ErrorNotFound      ErrorKind = "not_found"
+	ErrorRateLimit     ErrorKind = "rate_limit"
+	ErrorServer        ErrorKind = "server"
+	ErrorStream        ErrorKind = "stream"
 )
 
 // Error is a provider-neutral failure classification. Provider adapters map
@@ -320,14 +330,58 @@ func ErrorKindOf(err error) ErrorKind {
 	return classified.Category()
 }
 
-// NewHTTPError maps a provider HTTP response to a generic failure category.
+// NewHTTPError maps a provider HTTP response to a provider-neutral category.
+// Known context-limit error codes are classified from the structured provider
+// body; a status code such as HTTP 413 is intentionally not enough.
 func NewHTTPError(providerName string, statusCode int, message string) *Error {
+	code := providerErrorCode(message)
+	kind := httpErrorKind(statusCode)
+	if isContextLengthCode(code) {
+		kind = ErrorContextLength
+	}
 	return &Error{
 		Provider:   providerName,
-		Kind:       httpErrorKind(statusCode),
+		Kind:       kind,
+		Code:       code,
 		StatusCode: statusCode,
 		Message:    message,
 	}
+}
+
+func providerErrorCode(body string) string {
+	var envelope struct {
+		Error struct {
+			Code    string `json:"code"`
+			Type    string `json:"type"`
+			Message string `json:"message"`
+		} `json:"error"`
+		Code string `json:"code"`
+	}
+	if err := json.Unmarshal([]byte(body), &envelope); err != nil {
+		return ""
+	}
+	if envelope.Error.Code != "" {
+		return envelope.Error.Code
+	}
+	if envelope.Error.Type == "invalid_request_error" && strings.HasPrefix(strings.TrimSpace(envelope.Error.Message), "prompt is too long:") {
+		return "prompt_too_long"
+	}
+	return envelope.Code
+}
+
+func isContextLengthCode(code string) bool {
+	switch code {
+	case "context_length_exceeded", "max_context_length", "prompt_too_long":
+		return true
+	default:
+		return false
+	}
+}
+
+// IsContextOverflow reports whether a provider explicitly rejected the
+// request because its context length was exceeded.
+func IsContextOverflow(err error) bool {
+	return ErrorKindOf(err) == ErrorContextLength
 }
 
 func httpErrorKind(statusCode int) ErrorKind {

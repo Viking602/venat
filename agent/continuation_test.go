@@ -184,6 +184,49 @@ func TestEngineEffectOperationIDsAreStableAcrossHooksAndInterceptors(t *testing.
 		t.Fatalf("transcript tool operation ID = %q, want turn:0:call:0", transcriptOperationID)
 	}
 }
+func TestValidateContinuationAccountsContextUsageSnapshots(t *testing.T) {
+	assistant := message.NewText(message.RoleAssistant, "done")
+	continuation := Continuation{
+		SchemaVersion: ContinuationSchemaVersion,
+		Request:       Request{Prompt: "hi"},
+		Messages: []message.Message{
+			message.NewText(message.RoleUser, "hi"),
+			assistant,
+		},
+		Usage: provider.Usage{InputTokens: 2, OutputTokens: 1, TotalTokens: 3},
+		Steps: []Step{{
+			Index: 0,
+			ModelCall: &ModelCall{
+				Model:        "test-model",
+				InputTokens:  2,
+				OutputTokens: 1,
+				TotalTokens:  3,
+				StopReason:   provider.StopReasonComplete,
+			},
+			Decision:   StepDecisionFinish,
+			BudgetUsed: BudgetUsage{Tokens: 3},
+		}},
+		Phase:             ContinuationValidatingOutput,
+		NextOperationTurn: 1,
+	}
+	if err := ValidateContinuation(continuation); err != nil {
+		t.Fatalf("ValidateContinuation() without context usage error = %v", err)
+	}
+
+	contextUsage := provider.Usage{InputTokens: 4, OutputTokens: 1, TotalTokens: 5}
+	continuation.ContextUsage = contextUsage
+	continuation.Usage = provider.Usage{InputTokens: 6, OutputTokens: 2, TotalTokens: 8}
+	continuation.Steps[0].ContextUsage = contextUsage
+	continuation.Steps[0].BudgetUsed.Tokens = 8
+	if err := ValidateContinuation(continuation); err != nil {
+		t.Fatalf("ValidateContinuation() with context usage error = %v", err)
+	}
+
+	continuation.Usage.TotalTokens = 7
+	if err := ValidateContinuation(continuation); !errors.Is(err, ErrInvalidContinuation) {
+		t.Fatalf("ValidateContinuation() error = %v, want ErrInvalidContinuation", err)
+	}
+}
 
 func TestEngineResumeRejectsCorruptContinuationWithoutEffects(t *testing.T) {
 	continuation := Continuation{

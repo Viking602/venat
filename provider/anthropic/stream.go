@@ -155,14 +155,16 @@ type streamState struct {
 	finished           bool
 	truncated          error
 	usage              provider.Usage
-	response           provider.ResponseMetadata
 	stopReason         provider.StopReason
+	response           provider.ResponseMetadata
 	toolCalls          map[int]provider.ToolCallDelta
+	emittedToolCalls   map[int]bool
 	blocks             map[int]contentBlock
 	blockOrder         []int
 	message            json.RawMessage
 	contextUsage       provider.ContextUsageObserver
 	contextUsageCalled bool
+	completeToolCalls  bool
 }
 
 func (d Driver) Stream(ctx context.Context, request provider.Request) (provider.Stream, error) {
@@ -216,10 +218,12 @@ func (d Driver) Stream(ctx context.Context, request provider.Request) (provider.
 	return &anthropicStream{
 		body: resp.Body,
 		state: streamState{
-			reader:       shared.NewReader(resp.Body),
-			toolCalls:    map[int]provider.ToolCallDelta{},
-			blocks:       map[int]contentBlock{},
-			contextUsage: request.ContextUsage,
+			reader:            shared.NewReader(resp.Body),
+			toolCalls:         map[int]provider.ToolCallDelta{},
+			emittedToolCalls:  map[int]bool{},
+			blocks:            map[int]contentBlock{},
+			contextUsage:      request.ContextUsage,
+			completeToolCalls: request.CompleteToolCalls,
 		},
 	}, nil
 }
@@ -445,6 +449,10 @@ func (s *anthropicStream) consume(parsed eventEnvelope) (provider.Event, bool, e
 		s.recordContentBlockStart(parsed)
 	case "content_block_delta":
 		s.recordContentBlockDelta(parsed)
+	case "content_block_stop":
+		if s.state.completeToolCalls {
+			s.emitCompleteToolCall(parsed.Index)
+		}
 	case "message_delta":
 		s.state.usage.OutputTokens = parsed.Usage.OutputTokens
 		s.state.usage.TotalTokens = s.state.usage.InputTokens + parsed.Usage.OutputTokens
@@ -587,6 +595,24 @@ func (s *anthropicStream) recordContentBlockDelta(parsed eventEnvelope) {
 	s.state.blocks[parsed.Index] = block
 }
 
+func (s *anthropicStream) emitCompleteToolCall(index int) {
+	if s.state.emittedToolCalls[index] {
+		return
+	}
+	current := s.state.toolCalls[index]
+	block := s.block(index)
+	if current.ID == "" || current.Name == "" || !json.Valid(block.Input) {
+		return
+	}
+	call := message.ToolCall{
+		ID:        current.ID,
+		Name:      current.Name,
+		Arguments: append(json.RawMessage(nil), block.Input...),
+	}
+	s.state.pending = append(s.state.pending, provider.Event{Kind: provider.EventToolCall, ToolCall: &call})
+	s.state.emittedToolCalls[index] = true
+}
+
 func (s *anthropicStream) startBlock(index int, block contentBlock) {
 	if existing, ok := s.state.blocks[index]; ok {
 		if block.Type == "" {
@@ -708,6 +734,9 @@ func anthropicError(errorType, message string) error {
 		kind = provider.ErrorRateLimit
 	case "invalid_request_error":
 		kind = provider.ErrorInvalidRequest
+		if strings.HasPrefix(strings.TrimSpace(message), "prompt is too long:") {
+			kind = provider.ErrorContextLength
+		}
 	case "authentication_error":
 		kind = provider.ErrorAuthentication
 	case "permission_error":
@@ -790,7 +819,7 @@ func toAnthropicRequest(messages []message.Message) (any, []anthropicMessage) {
 			pendingToolResults = nil
 		}
 	}
-	for _, msg := range messages {
+	for _, msg := range message.ContextView(messages) {
 		switch msg.Role {
 		case message.RoleSystem:
 			flush()
@@ -1005,6 +1034,8 @@ func mapAnthropicStopReason(reason string) provider.StopReason {
 	switch reason {
 	case "end_turn", "stop_sequence":
 		return provider.StopReasonComplete
+	case "pause_turn":
+		return provider.StopReasonPause
 	case "max_tokens":
 		return provider.StopReasonLength
 	case "tool_use":

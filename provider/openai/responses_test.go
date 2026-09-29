@@ -1316,3 +1316,16 @@ data: {"type":"response.completed","response":{"output":[{"id":"msg_1","type":"m
 		}
 	}
 }
+
+func TestResponsesCommentaryOutputDoesNotInferPause(t *testing.T) {
+	stream := &responsesStream{}
+	event, done, err := stream.completed(responsesResponse{
+		Output: []byte(`[{"id":"msg_1","type":"message","phase":"commentary"}]`),
+	})
+	if err != nil {
+		t.Fatalf("completed() error = %v", err)
+	}
+	if !done || event.Kind != provider.EventDone || event.StopReason != provider.StopReasonComplete {
+		t.Fatalf("commentary-only response = %#v, done %v; want explicit complete", event, done)
+	}
+}

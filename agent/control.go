@@ -17,12 +17,23 @@ var (
 	errControlUsed   = errors.New("agent control already belongs to an execution")
 	// Fixed limits bound queued user input; applications own admission policy.
 	errControlLimit = errors.New("agent input queue limit exceeded")
+	// errControlSteer is only the cause of a turn-local cancellation. It must
+	// never cancel the execution context or permanently close Control.
+	errControlSteer = errors.New("agent model turn interrupted by steering")
 )
+
+const maxControlQueue = 64
 
 type queuedInput struct {
 	message message.Message
 	ack     chan error
 	size    int
+	seq     uint64
+}
+
+type controlTurnState struct {
+	cancel  context.CancelCauseFunc
+	started func() bool
 }
 
 // Control belongs to exactly one Engine execution. Its zero value is ready to
@@ -36,8 +47,12 @@ type Control struct {
 	cancel    context.CancelFunc
 	ctx       context.Context
 	pending   []queuedInput
+	steers    []queuedInput
+	followups []queuedInput
 	inflight  []queuedInput
 	bytes     int
+	nextSeq   uint64
+	turn      controlTurnState
 }
 
 // Send queues authorized user input for the next safe model boundary. A nil
@@ -45,8 +60,49 @@ type Control struct {
 // yields exactly one result: nil after boundary observers succeed, or an error
 // if the execution cannot consume it. A failed persistence acknowledgement can
 // be ambiguous; inspect durable state before resending. Send never accepts a
-// budget change, tool output, peer-agent message, or system instruction.
+// budget change, raw tool-result block, or system instruction. Applications
+// forwarding worker evidence must label it as untrusted data; the collaboration
+// completion hook supplies that labeling and tracks consumption receipts.
 func (control *Control) Send(input Request) (<-chan error, error) {
+	if control == nil {
+		return nil, errControlClosed
+	}
+	return control.enqueue(input, &control.pending)
+}
+
+// Steer queues an authorized direction correction and promptly interrupts a
+// safe active model turn. Send and Steer retain admission order when consumed
+// together, so an older user message is never reordered after a newer
+// correction. If a model stream is active and no streaming tool has begun, the
+// stream is interrupted with a turn-local cancellation; the execution remains
+// alive and consumes the correction on its next safe boundary. If early tool
+// overlap has already started, interruption is deferred so its effect/result
+// pairing remains factual; unstarted calls are skipped before dispatch.
+func (control *Control) Steer(input Request) (<-chan error, error) {
+	if control == nil {
+		return nil, errControlClosed
+	}
+	ack, err := control.enqueue(input, &control.steers)
+	if err != nil {
+		return nil, err
+	}
+	control.mu.Lock()
+	control.interruptTurnLocked()
+	control.mu.Unlock()
+	return ack, nil
+}
+
+// FollowUp queues authorized work for a subsequent model turn. Unlike Steer it
+// never interrupts the current model or tool loop; it is consumed only after
+// that work reaches a natural model boundary.
+func (control *Control) FollowUp(input Request) (<-chan error, error) {
+	if control == nil {
+		return nil, errControlClosed
+	}
+	return control.enqueue(input, &control.followups)
+}
+
+func (control *Control) enqueue(input Request, queue *[]queuedInput) (<-chan error, error) {
 	if control == nil {
 		return nil, errControlClosed
 	}
@@ -63,16 +119,28 @@ func (control *Control) Send(input Request) (<-chan error, error) {
 	}
 	control.mu.Lock()
 	defer control.mu.Unlock()
-	if !control.accepting || control.ctx.Err() != nil {
+	if !control.accepting || control.ctx == nil || control.ctx.Err() != nil {
 		return nil, errControlClosed
 	}
-	if len(control.pending)+len(control.inflight) >= 64 || len(encoded) > 1<<20 || control.bytes+len(encoded) > 4<<20 {
+	if control.queueLenLocked() >= maxControlQueue || len(encoded) > 1<<20 || control.bytes+len(encoded) > 4<<20 {
 		return nil, errControlLimit
 	}
 	ack := make(chan error, 1)
-	control.pending = append(control.pending, queuedInput{message: current, ack: ack, size: len(encoded)})
+	control.nextSeq++
+	*queue = append(*queue, queuedInput{message: current, ack: ack, size: len(encoded), seq: control.nextSeq})
 	control.bytes += len(encoded)
 	return ack, nil
+}
+
+func (control *Control) queueLenLocked() int {
+	return len(control.pending) + len(control.steers) + len(control.followups) + len(control.inflight)
+}
+
+func (control *Control) interruptTurnLocked() {
+	if control.turn.cancel == nil || control.turn.started != nil && control.turn.started() {
+		return
+	}
+	control.turn.cancel(errControlSteer)
 }
 
 // Cancel interrupts the execution's context, including its current model/tool
@@ -86,6 +154,9 @@ func (control *Control) Cancel() {
 	control.accepting = false
 	if control.cancel != nil {
 		control.cancel()
+	}
+	if control.turn.cancel != nil {
+		control.turn.cancel(context.Canceled)
 	}
 }
 
@@ -108,13 +179,46 @@ func (control *Control) finish() {
 	control.mu.Lock()
 	defer control.mu.Unlock()
 	control.accepting = false
-	control.cancel()
-	for _, pending := range append(control.inflight, control.pending...) {
+	if control.cancel != nil {
+		control.cancel()
+	}
+	if control.turn.cancel != nil {
+		control.turn.cancel(context.Canceled)
+		control.turn = controlTurnState{}
+	}
+	all := make([]queuedInput, 0, control.queueLenLocked())
+	all = append(all, control.inflight...)
+	all = append(all, control.steers...)
+	all = append(all, control.pending...)
+	all = append(all, control.followups...)
+	for _, pending := range all {
 		pending.ack <- errControlClosed
 		close(pending.ack)
 	}
-	control.pending, control.inflight = nil, nil
+	control.pending, control.steers, control.followups, control.inflight = nil, nil, nil, nil
 	control.bytes = 0
+}
+
+// beginTurn installs a child context for one model stream. Steering cancels
+// this child only while no early tool has started. The returned cleanup clears
+// the registration even when provider collection fails.
+func (control *Control) beginTurn(ctx context.Context, started func() bool) (context.Context, func()) {
+	if control == nil {
+		return ctx, func() {}
+	}
+	turnCtx, cancel := context.WithCancelCause(ctx)
+	control.mu.Lock()
+	control.turn = controlTurnState{cancel: cancel, started: started}
+	if len(control.steers) > 0 {
+		control.interruptTurnLocked()
+	}
+	control.mu.Unlock()
+	return turnCtx, func() {
+		control.mu.Lock()
+		control.turn = controlTurnState{}
+		control.mu.Unlock()
+		cancel(nil)
+	}
 }
 
 func (control *Control) take() []message.Message {
@@ -123,13 +227,30 @@ func (control *Control) take() []message.Message {
 	}
 	control.mu.Lock()
 	defer control.mu.Unlock()
-	control.inflight = append(control.inflight, control.pending...)
-	inputs := make([]message.Message, 0, len(control.pending))
-	for _, input := range control.pending {
+	merged := mergeQueued(control.steers, control.pending)
+	count := len(merged)
+	control.inflight = append(control.inflight, merged...)
+	inputs := make([]message.Message, 0, count)
+	for _, input := range merged {
 		inputs = append(inputs, message.Clone(input.message))
 	}
-	control.pending = nil
+	control.steers, control.pending = nil, nil
 	return inputs
+}
+
+func mergeQueued(first, second []queuedInput) []queuedInput {
+	merged := make([]queuedInput, 0, len(first)+len(second))
+	for left, right := 0, 0; left < len(first) || right < len(second); {
+		switch {
+		case right == len(second) || left < len(first) && first[left].seq < second[right].seq:
+			merged = append(merged, first[left])
+			left++
+		default:
+			merged = append(merged, second[right])
+			right++
+		}
+	}
+	return merged
 }
 
 func (control *Control) acknowledge(err error) {
@@ -160,6 +281,44 @@ func validatePendingInput(history, pending []message.Message) error {
 	return nil
 }
 
+// hasSteer reports a correction still waiting to be admitted at a model
+// boundary. Once taken, it is already part of the next request and must not
+// cause that request's tool calls to be skipped.
+func (control *Control) hasSteer() bool {
+	if control == nil {
+		return false
+	}
+	control.mu.Lock()
+	defer control.mu.Unlock()
+	return len(control.steers) > 0
+}
+
+type controlDispatchContextKey struct{}
+
+func withControlDispatch(ctx context.Context, control *Control) context.Context {
+	if control == nil {
+		return ctx
+	}
+	return context.WithValue(ctx, controlDispatchContextKey{}, control)
+}
+
+func controlFromDispatch(ctx context.Context) *Control {
+	if ctx == nil {
+		return nil
+	}
+	control, _ := ctx.Value(controlDispatchContextKey{}).(*Control)
+	return control
+}
+
+func (control *Control) shouldSkipTool() bool {
+	if control == nil {
+		return false
+	}
+	control.mu.Lock()
+	defer control.mu.Unlock()
+	return len(control.steers) > 0
+}
+
 // Terminal admission and Send use the same lock. Inputs accepted before this
 // decision force another model step; later sends are rejected immediately.
 func (control *Control) continueOrSeal() bool {
@@ -168,9 +327,30 @@ func (control *Control) continueOrSeal() bool {
 	}
 	control.mu.Lock()
 	defer control.mu.Unlock()
-	if len(control.pending) > 0 {
+	if len(control.pending)+len(control.steers) > 0 {
+		return true
+	}
+	if len(control.followups) > 0 {
+		control.pending = append(control.pending, control.followups...)
+		control.followups = nil
 		return true
 	}
 	control.accepting = false
 	return false
+}
+
+// Recovery may replace the overlap executor. Publish its stable predicate under
+// the same lock as Steer, rather than closing over a concurrently reassigned pointer.
+func (control *Control) updateTurnStarted(started func() bool) {
+	if control == nil {
+		return
+	}
+	control.mu.Lock()
+	defer control.mu.Unlock()
+	if control.turn.cancel != nil {
+		control.turn.started = started
+		if len(control.steers) > 0 {
+			control.interruptTurnLocked()
+		}
+	}
 }

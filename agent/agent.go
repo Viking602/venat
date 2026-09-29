@@ -60,8 +60,9 @@ type LoopInput struct {
 	UnlimitedIterations bool
 	// OperationTurn is the next durable tool-call turn ordinal. Checkpoint
 	// recovery restores it so compaction cannot reuse a prior operation ID.
-	OperationTurn int
-	OnEvent       func(provider.Event) error
+	OperationTurn      int
+	SafeStreamingTools []string
+	OnEvent            func(provider.Event) error
 
 	// Sink receives transient provider and tool-result frames as the loop runs.
 	// Its errors abort the current turn.
@@ -82,6 +83,10 @@ type LoopInput struct {
 	OutputGuardrails []OutputGuardrail
 	OutputObserver   OutputGuardrailObserver
 
+	// ResponseContinuation customizes the instruction used after a completed
+	// response hits the provider output limit. Empty uses a continuation that
+	// preserves the requested detail instead of forcing a shorter answer.
+	ResponseContinuation string
 	// MaxTokens / MaxToolCalls / MaxSteps are the per-loop budget ceilings.
 	// Zero means unbounded on that dimension. They are enforced fail-closed
 	// but only on turns that would continue the loop: a run that is about to
@@ -143,12 +148,17 @@ type LoopInput struct {
 	continuationRequest  Request
 	continuationPolicy   OutputPolicy
 	controlBound         bool
+	overlap              *streamOverlapState
 	repairCount          int
 	activeElapsed        time.Duration
 	segmentStarted       time.Time
 	initialUsage         provider.Usage
+	initialContextUsage  provider.Usage
 	initialSteps         []Step
 	initialToolCallsUsed int
+	// contextUsage is an invocation-local pointer shared with boundary helpers
+	// reached through copied LoopInput values.
+	contextUsage *provider.Usage
 }
 
 // LoopOutput is the message-level result from Engine.RunMessages. The
@@ -171,9 +181,10 @@ type LoopOutput struct {
 // the low-level message-driven entry; it ignores the Engine defaults and reads
 // everything it needs from LoopInput.
 type Engine struct {
-	Provider provider.Driver
-	Tools    *tool.Bus
-	Hooks    HookChain
+	Provider    provider.Driver
+	Tools       *tool.Bus
+	OutputStore *tool.OutputStore
+	Hooks       HookChain
 
 	Model          string
 	Temperature    float64
@@ -182,6 +193,7 @@ type Engine struct {
 	ToolMode       tool.Mode
 	LoopPolicy     LoopPolicy
 	ContextBuilder ContextManager
+	WorkingMemory  *WorkingMemory
 	// OperationTurn seeds the next durable tool-call turn ordinal for resumed
 	// executions. New executions leave it at zero.
 	OperationTurn int
@@ -207,13 +219,17 @@ type Engine struct {
 	// StopSequences are forwarded to every provider turn the loop issues.
 	StopSequences []string
 	// godoc-allow-any: provider-specific request extensions are intentionally open.
-	ExtraBody         map[string]any
-	PromptCacheKey    string
-	ServiceTier       string
-	ParallelToolCalls *bool
-	ContextUsage      provider.ContextUsageObserver
-	ModelInterceptor  provider.StreamInterceptor
-	ToolInterceptor   tool.Interceptor
+	ExtraBody          map[string]any
+	PromptCacheKey     string
+	ServiceTier        string
+	ParallelToolCalls  *bool
+	ContextUsage       provider.ContextUsageObserver
+	ModelInterceptor   provider.StreamInterceptor
+	ToolInterceptor    tool.Interceptor
+	SafeStreamingTools []string
+
+	// ResponseContinuation customizes output-length recovery instructions.
+	ResponseContinuation string
 
 	// OutputGuardrails run in order against the terminal assistant output and
 	// may allow, replace, retry, or block it.
@@ -235,6 +251,13 @@ type Engine struct {
 // RunMessages is the low-level loop that drives one LoopInput to
 // completion. Engine.Run is the execution-level wrapper most callers want.
 func (e Engine) RunMessages(ctx context.Context, input LoopInput) (out LoopOutput, err error) {
+	ctx = withFreshContextInputs(ctx, 0)
+	if e.OutputStore != nil {
+		e.Tools, err = attachOutputStoreTools(e.Tools, e.OutputStore)
+		if err != nil {
+			return LoopOutput{}, err
+		}
+	}
 	if !input.controlBound {
 		var finish func()
 		ctx, finish, err = input.Control.start(ctx)
@@ -259,10 +282,17 @@ func (e Engine) RunMessages(ctx context.Context, input LoopInput) (out LoopOutpu
 	input.OperationTurn = max(input.OperationTurn, nextToolOperationTurn(input.Messages))
 	current := message.CloneMessages(input.Messages)
 	totalUsage := input.initialUsage
+	contextUsage := input.initialContextUsage
+	input.contextUsage = &contextUsage
 	steps := cloneSteps(input.initialSteps)
 	if steps == nil {
 		steps = make([]Step, 0, stepCapacity)
 	}
+	ctx = WithWorkingMemoryObserver(ctx, func(_ context.Context, progress WorkingMemoryProgress) {
+		contextUsage = contextUsage.Add(progress.SummaryUsage)
+		totalUsage = totalUsage.Add(progress.SummaryUsage)
+		snapshotContextUsage(steps, totalUsage, contextUsage)
+	})
 	lastModelCall := (*ModelCall)(nil)
 	toolCallsUsed := input.initialToolCallsUsed
 	// turnsRun counts the model turns that have actually run (their usage folded
@@ -302,23 +332,17 @@ func (e Engine) RunMessages(ctx context.Context, input LoopInput) (out LoopOutpu
 		}
 		pendingInput := input.Control.take()
 		current = append(current, message.CloneMessages(pendingInput)...)
+		resetPauseForInput(steps, len(pendingInput))
+		turnCtx := withFreshContextInputs(ctx, len(pendingInput))
 		// Enforce the per-loop budget before every turn after the first.
 		// Reaching iteration N>0 means a prior turn chose to continue, so this
 		// is exactly a "will continue" boundary; a run that finished earlier
 		// returned before reaching here and is never charged a budget failure.
-		if iteration > 0 {
-			next, out, stop, preErr := loopTurnPreamble(ctx, input, current, totalUsage, steps, iteration, toolCallsUsed)
-			if stop {
-				return out, preErr
-			}
-			current = next
-		} else if input.ContextTokenTarget > 0 {
-			prepared, prepareErr := maybeCompactHistory(ctx, input, current, totalUsage)
-			if prepareErr != nil {
-				return loopErrorOutput(current, totalUsage, steps, iteration, toolCallsUsed), prepareErr
-			}
-			current = prepared
+		next, preambleOutput, preambleStop, preErr := prepareIterationContext(turnCtx, input, current, totalUsage, steps, iteration, toolCallsUsed)
+		if preambleStop {
+			return preambleOutput, preErr
 		}
+		current = next
 		if inputErr := validatePendingInput(current, pendingInput); inputErr != nil {
 			input.Control.acknowledge(inputErr)
 			return loopErrorOutput(current, totalUsage, steps, iteration, toolCallsUsed), inputErr
@@ -328,13 +352,23 @@ func (e Engine) RunMessages(ctx context.Context, input LoopInput) (out LoopOutpu
 		if boundaryErr != nil {
 			return loopErrorOutput(current, totalUsage, steps, iteration, toolCallsUsed), boundaryErr
 		}
-		assistant, usage, stopReason, identity, opened, turnErr := e.runTurn(ctx, current, input)
+		input.initialUsage = totalUsage
+		input.initialToolCallsUsed = toolCallsUsed
+		input.overlap = newStreamOverlapState(ctx, e, input)
+		modelCtx, releaseModelTurn := input.Control.beginTurn(turnCtx, input.overlap.started)
+		assistant, usage, stopReason, identity, opened, turnErr := e.runTurnWithContextRecovery(modelCtx, &current, &input)
+		releaseModelTurn()
 		if turnErr != nil {
-			failure := handleTurnFailure(
-				ctx, input, current, totalUsage, steps, turnsRun, iteration, toolCallsUsed,
+			failure := handleControlledTurnFailure(
+				ctx, modelCtx, &input, current, totalUsage, steps, turnsRun, iteration, toolCallsUsed,
 				assistant, usage, stopReason, identity, opened, turnErr,
 			)
 			current, totalUsage, steps, turnsRun = failure.current, failure.usage, failure.steps, failure.turnsRun
+			snapshotContextUsage(steps, totalUsage, contextUsage)
+			if failure.retry {
+				iteration = len(steps) - 1
+				continue
+			}
 			return failure.output, failure.err
 		}
 		operationTurn := input.OperationTurn
@@ -378,8 +412,8 @@ func (e Engine) RunMessages(ctx context.Context, input LoopInput) (out LoopOutpu
 			return out, err
 		}
 	}
-	if len(steps) > 0 && responseRecoveryCount(steps[len(steps)-1:]) > 0 {
-		return loopErrorOutput(current, totalUsage, steps, len(steps), toolCallsUsed), errIncompleteResponse
+	if exhaustedErr := incompleteLoopError(steps); exhaustedErr != nil {
+		return loopErrorOutput(current, totalUsage, steps, len(steps), toolCallsUsed), exhaustedErr
 	}
 	return LoopOutput{
 		Messages:      current,
@@ -391,6 +425,42 @@ func (e Engine) RunMessages(ctx context.Context, input LoopInput) (out LoopOutpu
 	}, nil
 }
 
+func recordInterruptedTurn(
+	ctx context.Context,
+	input LoopInput,
+	current []message.Message,
+	totalUsage provider.Usage,
+	steps []Step,
+	turnsRun, iteration, toolCallsUsed int,
+	assistant message.Message,
+	usage provider.Usage,
+	stopReason provider.StopReason,
+	identity provider.StreamIdentity,
+	opened bool,
+) ([]message.Message, provider.Usage, []Step, int, error) {
+	// A steering cancellation may arrive after a provider has emitted a
+	// complete-looking tool call but before the collector returns. Keep factual
+	// text/reasoning and usage, but never retain an unmatched call that a later
+	// turn could accidentally execute.
+	assistant.ToolCalls = nil
+	assistant.ProviderState = nil
+	before := len(current)
+	current, totalUsage, turnsRun = recordIncompleteTurn(current, assistant, totalUsage, usage, iteration, turnsRun)
+	if !opened {
+		return current, totalUsage, steps, turnsRun, nil
+	}
+	if len(current) == before {
+		current = append(current, message.Message{Role: message.RoleAssistant, Kind: message.KindStandard})
+	}
+	current[len(current)-1].ContextArchived = true
+	turnsRun = max(turnsRun, iteration+1)
+	steps = append(steps, turnFailureStep(iteration, identity, usage, stopReason, StepDecisionContinue, totalUsage, toolCallsUsed))
+	if err := observeFinalizedStep(ctx, input.StepObserver, steps); err != nil {
+		return current, totalUsage, steps, turnsRun, err
+	}
+	return current, totalUsage, steps, turnsRun, nil
+}
+
 type turnFailureResult struct {
 	current  []message.Message
 	usage    provider.Usage
@@ -398,6 +468,7 @@ type turnFailureResult struct {
 	turnsRun int
 	output   LoopOutput
 	err      error
+	retry    bool
 }
 
 func handleTurnFailure(
@@ -538,17 +609,21 @@ func (e Engine) runToolStep(
 		return out, true, err
 	}
 
-	prepared, terminal, prepErr := e.prepareToolCalls(ctx, assistant.ToolCalls)
+	earlyResults, pendingCalls, overlapErr := input.overlap.take(assistant.ToolCalls)
+	pendingPrepared, prepErr := input.overlap.preparePending(ctx, e, pendingCalls)
 	if prepErr != nil {
 		return loopErrorOutput(*current, *totalUsage, *steps, iteration+1, *toolCallsUsed), true, prepErr
 	}
+	prepared, terminal := mergePreparedToolCalls(e.Tools, assistant.ToolCalls, earlyResults, pendingPrepared)
 	*toolCallsUsed += len(assistant.ToolCalls)
 	dispatchCtx, childUsage := withAgentToolDispatchContext(ctx, input.MaxTokens, *totalUsage)
-	results, dispatchErr := e.dispatchPreparedTools(dispatchCtx, prepared, input.ToolMode, input.Sink)
-	*totalUsage = (*totalUsage).Add(childUsage.snapshot())
+	dispatchCtx = withControlDispatch(dispatchCtx, input.Control)
+	normalResults, dispatchErr := e.dispatchPreparedTools(dispatchCtx, pendingPrepared, input.ToolMode, input.Sink)
+	results, recordedResults, earlyUsage := mergeCompletedToolResults(assistant.ToolCalls, earlyResults, normalResults)
+	*totalUsage = (*totalUsage).Add(childUsage.snapshot()).Add(earlyUsage)
 	(*steps)[len(*steps)-1].BudgetUsed = BudgetUsage{Tokens: int64(totalUsage.TotalTokens), ToolCalls: *toolCallsUsed}
-	appendErr := appendToolResults(ctx, current, results, input.Sink)
-	if executionErr := errors.Join(dispatchErr, appendErr); executionErr != nil {
+	appendErr := appendToolResults(ctx, current, recordedResults, input.Sink)
+	if executionErr := errors.Join(overlapErr, dispatchErr, appendErr); executionErr != nil {
 		return loopErrorOutput(*current, *totalUsage, *steps, iteration+1, *toolCallsUsed), true, executionErr
 	}
 	if terminal {
@@ -596,6 +671,9 @@ func (e Engine) finalizeNoToolStep(
 	iteration int,
 	toolCallsUsed int,
 ) ([]message.Message, []Step, LoopOutput, bool, error) {
+	if stopReason == provider.StopReasonPause {
+		return e.finishPausedTurn(ctx, input, current, assistant, modelCall, totalUsage, steps, iteration, toolCallsUsed, stopReason)
+	}
 	base := current
 	current = appendFinalAssistant(current, assistant)
 	steps = append(steps, Step{
@@ -631,7 +709,7 @@ func (e Engine) finalizeNoToolStep(
 		}
 		return current, steps, LoopOutput{}, true, nil
 	}
-	correction, recoveryErr := responseRecovery(steps, finalOutput)
+	correction, recoveryErr := responseRecovery(steps, finalOutput, input.ResponseContinuation)
 	if recoveryErr != nil {
 		steps[len(steps)-1].Decision = StepDecisionFail
 		recoveryErr = errors.Join(recoveryErr, observeFinalizedStep(ctx, input.StepObserver, steps))
@@ -684,6 +762,11 @@ func (e Engine) finalizeToolStep(
 	latest := &steps[len(steps)-1]
 	latest.ToolCalls = toolCallTraces(assistant.ToolCalls, results)
 	latest.BudgetUsed = BudgetUsage{Tokens: int64(totalUsage.TotalTokens), ToolCalls: toolCallsUsed}
+	if terminal && input.Control.continueOrSeal() {
+		// Terminal tools completed naturally; queued follow-ups become eligible
+		// only now, after every effect/result pair from this turn is recorded.
+		terminal = false
+	}
 	latest.Decision = StepDecisionContinue
 	if terminal {
 		latest.Decision = StepDecisionFinish
@@ -768,8 +851,15 @@ func (e Engine) observeBoundary(
 	toolCallsUsed int,
 	phase ContinuationPhase,
 ) error {
+	if phase != ContinuationReady && len(steps) > 0 && input.contextUsage != nil {
+		steps[len(steps)-1].ContextUsage = *input.contextUsage
+	}
 	if e.Boundaries == nil {
 		return nil
+	}
+	contextUsage := provider.Usage{}
+	if input.contextUsage != nil {
+		contextUsage = *input.contextUsage
 	}
 	continuation := Continuation{
 		SchemaVersion:     ContinuationSchemaVersion,
@@ -777,6 +867,7 @@ func (e Engine) observeBoundary(
 		OutputPolicy:      input.continuationPolicy,
 		Messages:          message.CloneMessages(messages),
 		Usage:             usage,
+		ContextUsage:      contextUsage,
 		Steps:             cloneSteps(steps),
 		ToolCallsUsed:     toolCallsUsed,
 		RepairCount:       input.repairCount,
@@ -1244,10 +1335,78 @@ func cloneResponseFormat(value *provider.ResponseFormat) *provider.ResponseForma
 	return &cloned
 }
 
+const maxContextRecoveryAttempts = 2
+
+func (e Engine) runTurnWithContextRecovery(
+	ctx context.Context,
+	current *[]message.Message,
+	input *LoopInput,
+) (message.Message, provider.Usage, provider.StopReason, provider.StreamIdentity, bool, error) {
+	var original error
+	for attempt := 0; ; attempt++ {
+		attemptInput := *input
+		if attempt > 0 || attemptInput.overlap == nil {
+			attemptInput.overlap = newStreamOverlapState(ctx, e, attemptInput)
+		}
+		input.Control.updateTurnStarted(attemptInput.overlap.started)
+		assistant, usage, stop, identity, opened, err := e.runTurn(ctx, *current, attemptInput)
+		input.overlap = attemptInput.overlap
+		if err == nil || !provider.IsContextOverflow(err) || len(assistant.CanonicalContent()) > 0 || len(assistant.ToolCalls) > 0 || input.overlap.started() {
+			if original != nil && err != nil {
+				err = errors.Join(original, err)
+			}
+			return assistant, usage, stop, identity, opened, err
+		}
+		if original == nil {
+			original = err
+		}
+		if attempt >= maxContextRecoveryAttempts-1 {
+			return assistant, usage, stop, identity, opened, original
+		}
+		compacted, changed, compactErr := compactAfterContextOverflow(ctx, *input, *current)
+		if compactErr != nil {
+			return assistant, usage, stop, identity, opened, errors.Join(original, compactErr)
+		}
+		if !changed {
+			return assistant, usage, stop, identity, opened, original
+		}
+		*current = compacted
+	}
+}
+
+func compactAfterContextOverflow(ctx context.Context, input LoopInput, history []message.Message) ([]message.Message, bool, error) {
+	if input.ContextTokenTarget <= 1 && input.Compact == nil {
+		return history, false, nil
+	}
+	compactionInput, err := cacheSafeCompactionInput(history)
+	if err != nil {
+		return history, false, fmt.Errorf("agent: compact context after provider overflow: %w", err)
+	}
+	var compacted []message.Message
+	switch {
+	case input.CompactTo != nil && input.ContextTokenTarget > 1:
+		compacted, err = input.CompactTo(ctx, compactionInput, max(1, input.ContextTokenTarget*3/4))
+	case input.Compact != nil:
+		compacted, err = input.Compact(ctx, compactionInput)
+	default:
+		compacted, err = fitContext(ctx, compactionInput, max(1, input.ContextTokenTarget*3/4))
+	}
+	if err != nil {
+		return history, false, fmt.Errorf("agent: compact context after provider overflow: %w", err)
+	}
+	if err := message.ValidateCompleteTurns(compacted); err != nil {
+		return history, false, fmt.Errorf("agent: compact context after provider overflow: %w", err)
+	}
+	if err := validateCachePrefixPreserved(history, compacted); err != nil {
+		return history, false, fmt.Errorf("agent: compact context after provider overflow: %w", err)
+	}
+	return compacted, !reflect.DeepEqual(history, compacted), nil
+}
+
 // runTurn executes a single model turn: context transform, request assembly,
 // provider stream and event collection.
 func (e Engine) runTurn(ctx context.Context, current []message.Message, input LoopInput) (message.Message, provider.Usage, provider.StopReason, provider.StreamIdentity, bool, error) {
-	transformed, err := e.Hooks.TransformContext(ctx, current)
+	transformed, err := e.Hooks.TransformContext(ctx, message.ContextView(current))
 	if err != nil {
 		return message.Message{}, provider.Usage{}, provider.StopReasonError, provider.StreamIdentity{}, false, err
 	}
@@ -1265,6 +1424,7 @@ func (e Engine) runTurn(ctx context.Context, current []message.Message, input Lo
 		PromptCacheKey:    input.PromptCacheKey,
 		ServiceTier:       input.ServiceTier,
 		ParallelToolCalls: cloneBoolPointer(input.ParallelToolCalls),
+		CompleteToolCalls: len(input.SafeStreamingTools) > 0,
 		ContextUsage:      input.ContextUsage,
 		ExtraBody:         cloneAnyMap(input.ExtraBody),
 	}
@@ -1300,7 +1460,7 @@ func (e Engine) runTurn(ctx context.Context, current []message.Message, input Lo
 		return message.Message{}, provider.Usage{}, provider.StopReasonError, provider.StreamIdentity{}, false, err
 	}
 	providerStream = provider.WithStreamIdleTimeout(modelCtx, providerStream, modelTimeouts.StreamIdleTimeout)
-	assistant, usage, stop, collectErr := e.collect(modelCtx, providerStream, input.OnEvent, input.Sink)
+	assistant, usage, stop, collectErr := e.collectTurnStream(modelCtx, providerStream, input)
 	if collectErr != nil && errors.Is(modelCtx.Err(), context.DeadlineExceeded) && errors.Is(context.Cause(modelCtx), provider.ErrModelRequestTimeout) {
 		collectErr = errors.Join(provider.ErrModelRequestTimeout, context.DeadlineExceeded, collectErr)
 	}
@@ -1419,9 +1579,25 @@ func (e Engine) dispatchPreparedTools(ctx context.Context, prepared []tool.Call,
 	if bus == nil {
 		bus = tool.NewBus()
 	}
+	prepareAgentToolBatch(ctx, bus, prepared)
+	interceptor := e.ToolInterceptor
+	if control := controlFromDispatch(ctx); control != nil {
+		steerInterceptor := tool.InterceptorFunc(func(interceptCtx context.Context, next tool.Driver, call tool.Call, updateSink tool.UpdateSink) (tool.Result, error) {
+			if control.shouldSkipTool() {
+				return tool.Result{
+					ToolCallID: call.ID,
+					Name:       call.Name,
+					Content:    "not executed: superseded by steering",
+					IsError:    true,
+				}, nil
+			}
+			return next.Execute(interceptCtx, call, updateSink)
+		})
+		interceptor = tool.ChainInterceptors(steerInterceptor, interceptor)
+	}
 	results, batchErr := bus.ExecuteBatch(ctx, prepared, mode, tool.ExecuteOptions{
 		Sink:        updates,
-		Interceptor: e.ToolInterceptor,
+		Interceptor: interceptor,
 	})
 	items := make([]message.ToolResult, 0, len(results))
 	for index, current := range results {
@@ -1436,6 +1612,13 @@ func (e Engine) dispatchPreparedTools(ctx context.Context, prepared []tool.Call,
 		}
 		if err := e.Hooks.AfterToolCall(ctx, &item); err != nil {
 			return items, err
+		}
+		if e.OutputStore != nil && (index >= len(prepared) || !isOutputArtifactTool(prepared[index].Name)) {
+			processed, processErr := e.OutputStore.Process(ctx, item)
+			if processErr != nil {
+				return items, processErr
+			}
+			item = processed
 		}
 		items = append(items, item)
 	}
@@ -1556,6 +1739,9 @@ func (e Engine) collect(ctx context.Context, providerStream provider.Stream, onE
 			usage, stop, _ = applyNormalized(&assistant, events, false)
 			return assistant, usage, stop, cbErr
 		}
+		if overlap := streamOverlapFromContext(ctx); overlap != nil {
+			overlap.observe(event)
+		}
 	}
 	usage, stop, err = applyNormalized(&assistant, events, true)
 	if err != nil {
@@ -1637,4 +1823,37 @@ func applyNormalized(assistant *message.Message, events []provider.Event, requir
 		markIncompleteResponse(assistant, normalized.StopReason, err)
 	}
 	return normalized.Usage, normalized.StopReason, nil
+}
+
+func handleControlledTurnFailure(
+	ctx, modelCtx context.Context, input *LoopInput, current []message.Message,
+	totalUsage provider.Usage, steps []Step, turnsRun, iteration, toolCallsUsed int,
+	assistant message.Message, usage provider.Usage, stop provider.StopReason,
+	identity provider.StreamIdentity, opened bool, turnErr error,
+) turnFailureResult {
+	if !errors.Is(context.Cause(modelCtx), errControlSteer) {
+		return handleTurnFailure(ctx, *input, current, totalUsage, steps, turnsRun, iteration, toolCallsUsed, assistant, usage, stop, identity, opened, turnErr)
+	}
+	if opened {
+		input.OperationTurn++
+	}
+	current, totalUsage, steps, turnsRun, err := recordInterruptedTurn(
+		ctx, *input, current, totalUsage, steps, turnsRun, iteration,
+		toolCallsUsed, assistant, usage, stop, identity, opened,
+	)
+	return turnFailureResult{
+		current: current, usage: totalUsage, steps: steps, turnsRun: turnsRun,
+		output: loopErrorOutput(current, totalUsage, steps, turnsRun, toolCallsUsed),
+		err:    err, retry: err == nil,
+	}
+}
+
+func incompleteLoopError(steps []Step) error {
+	if err := pauseExhaustionError(steps); err != nil {
+		return err
+	}
+	if len(steps) > 0 && responseRecoveryCount(steps[len(steps)-1:]) > 0 {
+		return errIncompleteResponse
+	}
+	return nil
 }

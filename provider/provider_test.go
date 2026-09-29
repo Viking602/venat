@@ -249,6 +249,7 @@ func TestStopReasonConstants(t *testing.T) {
 	reasons := []StopReason{
 		StopReasonUnknown,
 		StopReasonComplete,
+		StopReasonPause,
 		StopReasonToolUse,
 		StopReasonLength,
 		StopReasonContentFilter,
@@ -256,7 +257,7 @@ func TestStopReasonConstants(t *testing.T) {
 		StopReasonAborted,
 		StopReasonError,
 	}
-	expected := []string{"unknown", "complete", "tool_use", "length", "content_filter", "max_turns", "aborted", "error"}
+	expected := []string{"unknown", "complete", "pause", "tool_use", "length", "content_filter", "max_turns", "aborted", "error"}
 
 	for i, reason := range reasons {
 		if string(reason) != expected[i] {

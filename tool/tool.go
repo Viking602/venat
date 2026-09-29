@@ -593,38 +593,87 @@ func (b *Bus) ExecuteBatch(ctx context.Context, calls []Call, mode Mode, options
 	if len(calls) > MaxBatchCalls {
 		return nil, fmt.Errorf("%w: %d > %d", ErrTooManyToolCalls, len(calls), MaxBatchCalls)
 	}
-	if mode == ModeParallel && !b.requiresSequential(calls) {
-		options.Sink = synchronizeUpdateSink(options.Sink)
-		return b.executeParallel(ctx, calls, options)
-	}
-	results := make([]Result, 0, len(calls))
-	for index, call := range calls {
-		result, err := b.Execute(ctx, call, options)
-		if err != nil {
-			failures := make([]CallExecutionError, 0, len(calls)-index)
-			failures = append(failures, CallExecutionError{CallID: call.ID, Err: err})
-			for _, skipped := range calls[index+1:] {
-				failures = append(failures, CallExecutionError{
-					CallID: skipped.ID,
-					Err:    errors.Join(ErrNotExecuted, context.Canceled),
-				})
+	if mode != ModeParallel {
+		results := make([]Result, 0, len(calls))
+		for index, call := range calls {
+			result, err := b.Execute(ctx, call, options)
+			if err != nil {
+				failures := []CallExecutionError{{CallID: call.ID, Err: err}}
+				for _, skipped := range calls[index+1:] {
+					failures = append(failures, CallExecutionError{
+						CallID: skipped.ID,
+						Err:    skippedCallError(ctx),
+					})
+				}
+				return results, &BatchExecutionError{Failures: failures}
 			}
-			return results, &BatchExecutionError{Failures: failures}
+			results = append(results, result)
+		}
+		return results, nil
+	}
+
+	results := make([]Result, 0, len(calls))
+	for start := 0; start < len(calls); {
+		end := start
+		for end < len(calls) && !b.isSequentialCall(calls[end]) {
+			end++
+		}
+		if end > start {
+			groupOptions := options
+			groupOptions.Sink = synchronizeUpdateSink(options.Sink)
+			groupResults, groupErr := b.executeParallel(ctx, calls[start:end], groupOptions)
+			results = append(results, groupResults...)
+			if groupErr != nil {
+				return results, batchStoppedError(groupErr, calls[end:])
+			}
+			start = end
+			continue
+		}
+
+		result, err := b.Execute(ctx, calls[start], options)
+		if err != nil {
+			return results, batchStoppedError(
+				&BatchExecutionError{Failures: []CallExecutionError{{
+					CallID: calls[start].ID,
+					Err:    err,
+				}}},
+				calls[start+1:],
+			)
 		}
 		results = append(results, result)
+		start++
 	}
 	return results, nil
 }
+func skippedCallError(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return errors.Join(ErrNotExecuted, err)
+	}
+	return ErrNotExecuted
+}
 
-func (b *Bus) requiresSequential(calls []Call) bool {
+func batchStoppedError(err error, skipped []Call) error {
+	var batch *BatchExecutionError
+	if !errors.As(err, &batch) {
+		return err
+	}
+	if len(skipped) == 0 {
+		return batch
+	}
+	failures := slices.Clone(batch.Failures)
+	for _, call := range skipped {
+		failures = append(failures, CallExecutionError{
+			CallID: call.ID,
+			Err:    ErrNotExecuted,
+		})
+	}
+	return &BatchExecutionError{Failures: failures}
+}
+
+func (b *Bus) isSequentialCall(call Call) bool {
 	b.mu.RLock()
 	defer b.mu.RUnlock()
-	for _, call := range calls {
-		if b.definitions[call.Name].Concurrency == ConcurrencySequential {
-			return true
-		}
-	}
-	return false
+	return b.definitions[call.Name].Concurrency == ConcurrencySequential
 }
 
 func (b *Bus) executeParallel(ctx context.Context, calls []Call, options ExecuteOptions) ([]Result, error) {
