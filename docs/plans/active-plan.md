@@ -1,5 +1,40 @@
 # Active plan
 
+## Nonterminal pauses and live direction changes
+
+- Explicit provider pauses retain assistant state and continue automatically;
+  repeated non-progress and exhausted loop allowance report typed failures.
+- Control separates safe-boundary input, active steering, and deferred follow-up.
+- Worker handles and model tools expose steering without discarding history.
+- Already started writes retain real results; obsolete pending calls are skipped.
+- Local examples: `examples/pause-continuation` and `examples/live-steering`.
+
+
+## Practical agent runtime
+
+Implemented capabilities:
+
+- Local output artifacts with previews, range reads, and search.
+- Model-backed working memory, recent complete tool groups, summary usage, and
+  recognized context-overflow recovery.
+- Ordered parallel tool groups and concurrent child token reservations.
+- In-memory asynchronous workers with task tools, completion delivery,
+  retained follow-up context, and independent cancellation.
+- Executable acceptance checks through existing output guardrails.
+- Explicitly opted-in complete-call streaming for safe read tools.
+
+The six credential-free examples exercise execution mechanics, including real
+file/process verification and channel-controlled overlap. They do not establish
+real-model task quality, summary accuracy, or provider cache-hit improvements.
+Optional durability remains available but is not a prerequisite for these
+runtime capabilities. Current setup and ownership contracts are documented in
+`docs/agent-execution.md`.
+
+Verification: `make ci-local` passed, including lint, the full test suite,
+race tests, and all architecture gates. The six new examples and the existing
+interactive example passed as executable runtime smoke scenarios.
+
+
 ## Codex-style execution envelopes
 
 Status: implemented, 2026-09-20.

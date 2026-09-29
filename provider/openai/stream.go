@@ -11,6 +11,7 @@ import (
 	"mime"
 	"net/http"
 	"os"
+	"sort"
 	"strings"
 
 	"github.com/Viking602/venat/message"
@@ -147,9 +148,13 @@ type streamState struct {
 	usage                provider.Usage
 	stopReason           provider.StopReason
 	response             provider.ResponseMetadata
-	splitter             thinkSplitter
 	contextUsage         provider.ContextUsageObserver
 	contextUsageReported bool
+	toolCalls            map[int]*message.ToolCall
+	toolCallOrder        []int
+	emittedToolCalls     map[int]bool
+	completeToolCalls    bool
+	splitter             thinkSplitter
 }
 
 // thinkSplitter extracts <think>...</think> segments from a streamed token
@@ -262,8 +267,11 @@ func (d Driver) streamChatCompletions(ctx context.Context, request provider.Requ
 	return &openAIStream{
 		body: bodyStream,
 		state: streamState{
-			reader:       shared.NewReader(bodyStream),
-			contextUsage: request.ContextUsage,
+			reader:            shared.NewReader(bodyStream),
+			contextUsage:      request.ContextUsage,
+			toolCalls:         make(map[int]*message.ToolCall),
+			emittedToolCalls:  make(map[int]bool),
+			completeToolCalls: request.CompleteToolCalls,
 		},
 	}, nil
 }
@@ -548,6 +556,23 @@ func (s *openAIStream) processChoiceDelta(choice choiceChunk) {
 		}
 	}
 	for _, item := range choice.Delta.ToolCalls {
+		index := 0
+		if item.Index != nil {
+			index = *item.Index
+		}
+		call := s.state.toolCalls[index]
+		if call == nil {
+			call = &message.ToolCall{}
+			s.state.toolCalls[index] = call
+			s.state.toolCallOrder = append(s.state.toolCallOrder, index)
+		}
+		if item.ID != "" {
+			call.ID = item.ID
+		}
+		if item.Function.Name != "" {
+			call.Name = item.Function.Name
+		}
+		call.Arguments = append(call.Arguments, item.Function.Arguments...)
 		s.state.pending = append(s.state.pending, provider.Event{
 			Kind: provider.EventToolCallDelta,
 			ToolCallDelta: &provider.ToolCallDelta{
@@ -560,6 +585,30 @@ func (s *openAIStream) processChoiceDelta(choice choiceChunk) {
 	}
 	if choice.FinishReason != "" {
 		s.state.stopReason = mapOpenAIStopReason(choice.FinishReason)
+		if choice.FinishReason == "tool_calls" && s.state.completeToolCalls {
+			s.emitCompleteToolCalls()
+		}
+	}
+}
+
+func (s *openAIStream) emitCompleteToolCalls() {
+	order := append([]int(nil), s.state.toolCallOrder...)
+	sort.Ints(order)
+	for _, index := range order {
+		if s.state.emittedToolCalls[index] {
+			continue
+		}
+		call := s.state.toolCalls[index]
+		if call == nil || call.ID == "" || call.Name == "" || !json.Valid(call.Arguments) {
+			continue
+		}
+		copyCall := *call
+		copyCall.Arguments = append(json.RawMessage(nil), call.Arguments...)
+		s.state.pending = append(s.state.pending, provider.Event{
+			Kind:     provider.EventToolCall,
+			ToolCall: &copyCall,
+		})
+		s.state.emittedToolCalls[index] = true
 	}
 }
 
@@ -568,6 +617,7 @@ func (s *openAIStream) Close() error {
 }
 
 func toChatMessages(messages []message.Message) []chatMessage {
+	messages = message.ContextView(messages)
 	items := make([]chatMessage, 0, len(messages))
 	for _, msg := range messages {
 		item := chatMessage{Role: string(msg.Role)}

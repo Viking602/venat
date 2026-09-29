@@ -43,7 +43,7 @@ func markIncompleteResponse(assistant *message.Message, stop provider.StopReason
 	}
 }
 
-func responseRecovery(steps []Step, assistant message.Message) (message.Message, error) {
+func responseRecovery(steps []Step, assistant message.Message, continuation string) (message.Message, error) {
 	reason := assistant.Metadata[responseRecoveryKey]
 	if reason == "" {
 		return message.Message{}, nil
@@ -52,11 +52,13 @@ func responseRecovery(steps []Step, assistant message.Message) (message.Message,
 	if attempts >= maxResponseRecoveries {
 		return message.Message{}, fmt.Errorf("%w after %d corrections: %s", errIncompleteResponse, attempts, reason)
 	}
-	instruction := "The previous response was incomplete. Continue the task and provide a usable final answer."
+	instruction := "The previous response was incomplete. Continue the task and provide a complete usable final answer, preserving the requested level of detail. Do not repeat content that was already completed."
 	if reason == "invalid_tool_arguments" {
 		instruction = "The previous tool arguments were not valid JSON. No tools from that response were executed. Correct the arguments and issue complete tool calls with valid JSON."
 	} else if reason == "output_length" {
-		instruction = "The previous response reached the output limit. No tools from that response were executed. Continue with a shorter complete answer or complete tool calls."
+		if strings.TrimSpace(continuation) != "" {
+			instruction = continuation
+		}
 	}
 	return message.NewText(message.RoleUser, instruction), nil
 }

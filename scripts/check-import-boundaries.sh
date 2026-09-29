@@ -26,7 +26,7 @@ allowed_for_scope() {
     tool) allowed=(tool message) ;;
     skill) allowed=(skill) ;;
     agent) allowed=(agent message provider tool skill) ;;
-    orchestration) allowed=(orchestration agent message) ;;
+    orchestration) allowed=(orchestration agent message provider tool) ;;
     durable) allowed=(durable agent message provider tool) ;;
     *) return 1 ;;
   esac

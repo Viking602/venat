@@ -143,6 +143,19 @@ func TestNormalizeEventsConformanceCases(t *testing.T) {
 				}
 			},
 		},
+		{
+			name: "pause preserves terminal state and usage",
+			events: []Event{
+				{Kind: EventTextDelta, Text: "working"},
+				{Kind: EventDone, StopReason: StopReasonPause, Usage: Usage{InputTokens: 3, OutputTokens: 4, ReasoningTokens: 2, TotalTokens: 7}, ProviderState: json.RawMessage(`[{"type":"reasoning","id":"rs_pause"}]`)},
+			},
+			assertion: func(t *testing.T, response NormalizedResponse) {
+				if response.StopReason != StopReasonPause || response.Usage.TotalTokens != 7 ||
+					response.Usage.ReasoningTokens != 2 || string(response.ProviderState) != `[{"type":"reasoning","id":"rs_pause"}]` {
+					t.Fatalf("pause response = %#v", response)
+				}
+			},
+		},
 	}
 
 	for _, tt := range tests {

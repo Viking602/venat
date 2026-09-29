@@ -4,11 +4,11 @@
 [![CI](https://github.com/Viking602/venat/actions/workflows/ci.yml/badge.svg)](https://github.com/Viking602/venat/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/Viking602/venat?sort=semver)](https://github.com/Viking602/venat/releases)
 
-Venat is a typed Go SDK for bounded Agent loops, application-defined multi-Agent orchestration, and optional crash-safe execution. Applications import the packages they need and retain ownership of identity, routing policy, storage schema, deployment, and operations.
+Venat is a typed Go SDK for agents that work across long tasks: model-backed working memory, retrievable tool output, concurrent tools, live worker collaboration, and executable completion checks. Crash-safe execution is optional. Applications retain ownership of identity, routing policy, storage schema, deployment, and operations.
 
-For command-error correction, typed input, native JSON output, context fitting,
-and live user input, see [Agent execution](docs/agent-execution.md) and run
-`go run ./examples/interactive` for a credential-free local smoke scenario.
+For command-error correction, working memory, tool-output retrieval, live input,
+and task verification, see [Agent execution](docs/agent-execution.md).
+The credential-free examples below exercise real execution paths with local providers.
 
 > **Status:** The latest published release is [v0.17.0](https://github.com/Viking602/venat/releases/tag/v0.17.0). Public APIs may change before v1.0.
 
@@ -16,12 +16,12 @@ and live user input, see [Agent execution](docs/agent-execution.md) and run
 
 | Package | Responsibility |
 | --- | --- |
-| [`agent`](https://pkg.go.dev/github.com/Viking602/venat/agent) | One bounded model/tool loop, a synchronous AgentTool adapter, hooks, output validation, transient output, continuation, and resume |
+| [`agent`](https://pkg.go.dev/github.com/Viking602/venat/agent) | Model/tool loop, working memory, safe streaming overlap, child agents, task verification, continuation, and resume |
 | [`message`](https://pkg.go.dev/github.com/Viking602/venat/message) | Provider-neutral messages, content, tool calls, and tool results |
 | [`provider`](https://pkg.go.dev/github.com/Viking602/venat/provider) | Streaming model driver contract, interceptors, conformance helpers, and provider adapters |
-| [`tool`](https://pkg.go.dev/github.com/Viking602/venat/tool) | Typed tool drivers, validation, execution modes, real-time updates, and interceptors |
+| [`tool`](https://pkg.go.dev/github.com/Viking602/venat/tool) | Typed drivers, ordered parallel groups, output artifacts with read/search, real-time updates, and interceptors |
 | [`skill`](https://pkg.go.dev/github.com/Viking602/venat/skill) | Reusable instruction resources and discovery |
-| [`orchestration`](https://pkg.go.dev/github.com/Viking602/venat/orchestration) | Pure scheduling protocol plus bounded mechanical dispatch execution |
+| [`orchestration`](https://pkg.go.dev/github.com/Viking602/venat/orchestration) | Asynchronous worker runtime and task tools, plus the existing scheduling protocol and batch drive |
 | [`durable`](https://pkg.go.dev/github.com/Viking602/venat/durable) | Optional execution persistence, leases, checkpoints, effect settlement, replay, and reconciliation |
 | [`durable/contract`](https://pkg.go.dev/github.com/Viking602/venat/durable/contract) | Conformance suite for application-supplied durable backends |
 
@@ -58,6 +58,36 @@ if result.Failure != nil {
 
 Use `RunStream` with an `agent.Sink` for transient text, thinking, tool-call, tool-update, tool-result, done, and error frames. A tool function may accept `tool.UpdateSink` and emit typed progress or ordered content parts; the Bus supplies trusted call identity and per-call sequence. Sink delivery is synchronous and not durable output.
 
+## Long-task execution
+
+`agent.NewWorkingMemory` supplies a real model-backed context manager, not just a
+compaction callback. It preserves instructions, recent complete tool exchanges,
+and the latest user correction while summarizing older work. Configure its
+provider and model explicitly; summary usage is included in Agent usage.
+
+`tool.NewOutputStore` stores large tool results in a private local directory.
+Set `Engine.OutputStore` to register `tool_output_read` and `tool_output_search`
+automatically. The model gets a preview and stable reference, and can recover
+omitted evidence without rerunning the original tool. Close the caller-owned
+store when the session ends.
+
+Use `ToolMode: tool.ModeParallel` for ordered parallel groups separated by
+sequential tools. `Engine.SafeStreamingTools` additionally allows explicitly
+trusted read-only tools to start as complete tool calls arrive. It never grants
+permission to speculate on partially decoded arguments or arbitrary writes.
+
+`agent.NewToolVerifier` plugs application-selected checks into the existing output
+guardrail loop. A failed command returns actual diagnostics for correction;
+infrastructure failures are not converted into successful verification.
+
+Explicit provider pauses continue the same task without manual prompting or
+premature final-answer checks. During a run, use `Control.Steer` to correct the
+direction, `Control.Send` for non-interrupting input at a safe boundary, and
+`Control.FollowUp` for work after the current task naturally finishes.
+Steering preserves completed effects and skips obsolete calls not yet started.
+
+
+
 ## Delegating to a child Agent
 
 `agent.NewAgentTool` exposes an already configured child Engine as a
@@ -89,9 +119,9 @@ parent := agent.Engine{
 }
 ```
 
-The default input is `{"task":"..."}`. Applications keep ownership of Agent
-registries, identity, routing, workflows, process isolation, background work,
-and independently durable child lifecycles.
+The default input is `{"task":"..."}`. `NewAgentTool` is synchronous. For workers
+that continue while the parent works, use `orchestration.NewRuntime`.
+Applications still own routing, workspace/process isolation, and deployment.
 
 ## Application-defined orchestration
 
@@ -105,6 +135,24 @@ state, err := orchestration.Drive(ctx, scheduler, executor, orchestration.DriveO
 ```
 
 Agent identity, teams, routing strategy, shared state, approvals, and deployment are application concerns. Persist `orchestration.State` in application storage when orchestration itself must survive a restart.
+
+### Live worker collaboration
+
+`orchestration.NewRuntime` owns an in-memory worker pool and independently
+addressable tasks. `Runtime.Tools()` exposes `spawn`, `inspect`, `await`, `send`,
+`steer`, and `cancel` to a parent model. Follow-up messages retain child context.
+
+Attach `Runtime.CompletionHook(parentControl)` alongside `Engine.Control` to
+deliver labeled worker evidence at model boundaries and retain it in the parent
+transcript. Results do not wait for the slowest worker in a batch.
+`RequiredTasksGuardrail` can prevent premature completion while required work is
+pending. `Runtime.Close` cancels and joins runtime-owned work; interrupting a
+parent turn does not implicitly close the worker runtime.
+
+See `examples/async-agents` for a parent Engine that starts workers, consumes the
+fast result while a slow worker is still active, sends a follow-up, and cancels
+independent work.
+
 
 ## Optional durable execution
 
@@ -140,6 +188,14 @@ go run ./examples/agent
 go run ./examples/subagent
 go run ./examples/orchestration
 go run ./examples/durable
+go run ./examples/tool-output
+go run ./examples/working-memory
+go run ./examples/parallel-tools
+go run ./examples/async-agents
+go run ./examples/task-verification
+go run ./examples/streaming-tools
+go run ./examples/pause-continuation
+go run ./examples/live-steering
 ```
 
 The durable example keeps its illustrative backend inside the example directory; it is not a reusable storage adapter.

@@ -34,11 +34,15 @@ const (
 // Continuation is the complete provider-neutral state needed to resume one
 // Engine execution. Pending tool calls are derived from Messages.
 type Continuation struct {
-	SchemaVersion     int               `json:"schemaVersion"`
-	Request           Request           `json:"request"`
-	OutputPolicy      OutputPolicy      `json:"outputPolicy"`
-	Messages          []message.Message `json:"messages"`
-	Usage             provider.Usage    `json:"usage,omitempty"`
+	SchemaVersion int               `json:"schemaVersion"`
+	Request       Request           `json:"request"`
+	OutputPolicy  OutputPolicy      `json:"outputPolicy"`
+	Messages      []message.Message `json:"messages"`
+	Usage         provider.Usage    `json:"usage,omitempty"`
+	// ContextUsage is the cumulative usage of auxiliary context-model calls.
+	// It may exceed the latest Step.ContextUsage snapshot when work happened
+	// between steps and therefore had no step to attribute it to.
+	ContextUsage      provider.Usage    `json:"contextUsage,omitzero"`
 	Steps             []Step            `json:"steps,omitempty"`
 	ToolCallsUsed     int               `json:"toolCallsUsed,omitempty"`
 	RepairCount       int               `json:"repairCount,omitempty"`
@@ -125,8 +129,16 @@ func ValidateContinuation(continuation Continuation) error {
 	if continuation.SchemaVersion != 1 && continuation.SchemaVersion != ContinuationSchemaVersion {
 		return continuationError("unsupported schema version %d", continuation.SchemaVersion)
 	}
-	if continuation.SchemaVersion == 1 && (len(continuation.Request.Content) > 0 || continuation.OutputPolicy.Native) {
-		return continuationError("request content and native output require schema version 2")
+	if continuation.SchemaVersion == 1 {
+		if len(continuation.Request.Content) > 0 || continuation.OutputPolicy.Native ||
+			continuation.ContextUsage != (provider.Usage{}) {
+			return continuationError("request content, native output, and context usage require schema version 2")
+		}
+		for _, step := range continuation.Steps {
+			if step.ContextUsage != (provider.Usage{}) {
+				return continuationError("step context usage requires schema version 2")
+			}
+		}
 	}
 	if err := continuation.Request.Validate(); err != nil {
 		return continuationError("invalid request content: %v", err)
@@ -190,6 +202,7 @@ func validateContinuationSteps(continuation Continuation, analysis transcriptAna
 	firstGeneratedAssistant := len(analysis.assistantIndices) - len(continuation.Steps)
 	completedToolCalls := 0
 	var cumulativeUsage provider.Usage
+	var previousContextUsage provider.Usage
 	for index, step := range continuation.Steps {
 		assistant := continuation.Messages[analysis.assistantIndices[firstGeneratedAssistant+index]]
 		nextCompleted, nextUsage, err := validateContinuationStep(
@@ -200,12 +213,14 @@ func validateContinuationSteps(continuation Continuation, analysis transcriptAna
 			firstOperationTurn+index,
 			completedToolCalls,
 			cumulativeUsage,
+			previousContextUsage,
 		)
 		if err != nil {
 			return 0, provider.Usage{}, err
 		}
 		completedToolCalls = nextCompleted
 		cumulativeUsage = nextUsage
+		previousContextUsage = step.ContextUsage
 	}
 	return completedToolCalls, cumulativeUsage, nil
 }
@@ -218,12 +233,19 @@ func validateContinuationStep(
 	operationTurn int,
 	completedToolCalls int,
 	cumulativeUsage provider.Usage,
+	previousContextUsage provider.Usage,
 ) (int, provider.Usage, error) {
 	if step.Index != index {
 		return 0, provider.Usage{}, continuationError("step %d has index %d", index, step.Index)
 	}
 	if step.BudgetUsed.Tokens < 0 || step.BudgetUsed.ToolCalls < 0 || step.BudgetUsed.WallClock < 0 {
 		return 0, provider.Usage{}, continuationError("step %d has negative budget usage", index)
+	}
+	if err := validateContinuationUsage(step.ContextUsage); err != nil {
+		return 0, provider.Usage{}, continuationError("step %d context usage: %v", index, err)
+	}
+	if !usageContains(step.ContextUsage, previousContextUsage) {
+		return 0, provider.Usage{}, continuationError("step %d context usage regresses cumulative usage", index)
 	}
 	if step.ModelCall == nil || !validModelCallUsage(*step.ModelCall) {
 		return 0, provider.Usage{}, continuationError("step %d has missing, negative, or inconsistent model usage", index)
@@ -257,6 +279,7 @@ func validateContinuationStep(
 		pendingStep,
 		completedToolCalls,
 		cumulativeUsage,
+		step.ContextUsage,
 	); err != nil {
 		return 0, provider.Usage{}, err
 	}
@@ -271,8 +294,9 @@ func validateContinuationStepBudget(
 	pendingStep bool,
 	completedToolCalls int,
 	cumulativeUsage provider.Usage,
+	contextUsage provider.Usage,
 ) error {
-	minimumTokens := int64(cumulativeUsage.TotalTokens)
+	minimumTokens := int64(cumulativeUsage.Add(contextUsage).TotalTokens)
 	if index > 0 {
 		previousTokens := continuation.Steps[index-1].BudgetUsed.Tokens
 		currentModelTokens := int64(modelCallUsage(*step.ModelCall).TotalTokens)
@@ -295,15 +319,19 @@ func validateContinuationTotals(continuation Continuation, analysis transcriptAn
 	if continuation.ToolCallsUsed != completedToolCalls {
 		return continuationError("toolCallsUsed %d does not match completed execution count %d", continuation.ToolCallsUsed, completedToolCalls)
 	}
-	expectedTokens := int64(0)
+	expectedTokens := int64(continuation.ContextUsage.TotalTokens)
 	if len(continuation.Steps) > 0 {
-		expectedTokens = continuation.Steps[len(continuation.Steps)-1].BudgetUsed.Tokens
+		latest := continuation.Steps[len(continuation.Steps)-1]
+		expectedTokens = latest.BudgetUsed.Tokens
+		if !usageContains(continuation.ContextUsage, latest.ContextUsage) {
+			return continuationError("cumulative context usage is below step snapshot")
+		}
 	}
 	if int64(continuation.Usage.TotalTokens) != expectedTokens {
 		return continuationError("cumulative token usage does not match step budget")
 	}
-	if !usageContains(continuation.Usage, cumulativeModelUsage) {
-		return continuationError("cumulative usage is below model steps")
+	if !usageContains(continuation.Usage, cumulativeModelUsage.Add(continuation.ContextUsage)) {
+		return continuationError("cumulative usage is below model and context work")
 	}
 	if analysis.maxOperationTurn >= continuation.NextOperationTurn {
 		return continuationError("next operation turn %d does not follow transcript turn %d", continuation.NextOperationTurn, analysis.maxOperationTurn)
@@ -395,7 +423,13 @@ func validateContinuationScalars(continuation Continuation) error {
 	if err := validateContinuationOutputPolicy(continuation.OutputPolicy); err != nil {
 		return err
 	}
-	return validateContinuationUsage(continuation.Usage)
+	if err := validateContinuationUsage(continuation.Usage); err != nil {
+		return err
+	}
+	if err := validateContinuationUsage(continuation.ContextUsage); err != nil {
+		return continuationError("context usage: %v", err)
+	}
+	return nil
 }
 
 func validateContinuationBudget(budget *Budget) error {

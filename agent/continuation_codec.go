@@ -12,14 +12,29 @@ import (
 	"github.com/Viking602/venat/provider"
 )
 
-// Versions 1 and 2 share the closed outer field set. Version 1's nested request
-// and output-policy exclusions are validated before decoding this shared shape.
+// Version 1's nested request and output-policy exclusions are validated before
+// decoding this shared shape. Auxiliary context usage was added to version 2.
 type continuationWireV1 struct {
 	SchemaVersion     int               `json:"schemaVersion"`
 	Request           Request           `json:"request"`
 	OutputPolicy      OutputPolicy      `json:"outputPolicy"`
 	Messages          []message.Message `json:"messages"`
 	Usage             provider.Usage    `json:"usage"`
+	Steps             []Step            `json:"steps"`
+	ToolCallsUsed     int               `json:"toolCallsUsed"`
+	RepairCount       int               `json:"repairCount"`
+	ActiveElapsed     time.Duration     `json:"activeElapsed"`
+	NextOperationTurn int               `json:"nextOperationTurn"`
+	Phase             ContinuationPhase `json:"phase"`
+}
+
+type continuationWireV2 struct {
+	SchemaVersion     int               `json:"schemaVersion"`
+	Request           Request           `json:"request"`
+	OutputPolicy      OutputPolicy      `json:"outputPolicy"`
+	Messages          []message.Message `json:"messages"`
+	Usage             provider.Usage    `json:"usage"`
+	ContextUsage      provider.Usage    `json:"contextUsage,omitzero"`
 	Steps             []Step            `json:"steps"`
 	ToolCallsUsed     int               `json:"toolCallsUsed"`
 	RepairCount       int               `json:"repairCount"`
@@ -48,7 +63,18 @@ func EncodeContinuation(continuation Continuation) ([]byte, error) {
 	if err := ValidateContinuation(continuation); err != nil {
 		return nil, err
 	}
-	encoded, err := json.Marshal(continuationWireV1(continuation))
+	var wire any = continuationWireV2(continuation)
+	if continuation.SchemaVersion == 1 {
+		wire = continuationWireV1{
+			SchemaVersion: continuation.SchemaVersion, Request: continuation.Request,
+			OutputPolicy: continuation.OutputPolicy, Messages: continuation.Messages,
+			Usage: continuation.Usage, Steps: continuation.Steps,
+			ToolCallsUsed: continuation.ToolCallsUsed, RepairCount: continuation.RepairCount,
+			ActiveElapsed: continuation.ActiveElapsed, NextOperationTurn: continuation.NextOperationTurn,
+			Phase: continuation.Phase,
+		}
+	}
+	encoded, err := json.Marshal(wire)
 	if err != nil {
 		return nil, continuationError("encode continuation: %v", err)
 	}
@@ -102,8 +128,9 @@ func DecodeContinuation(data []byte) (Continuation, error) {
 		if _, exists := policyFields["native"]; exists {
 			return Continuation{}, continuationError("native output requires schema version 2")
 		}
+		return decodeContinuationV1(data, fields)
 	}
-	return decodeContinuationV1(data, fields)
+	return decodeContinuationV2(data, fields)
 }
 
 // MarshalJSON enforces the same strict, canonical wire contract used by
@@ -145,8 +172,69 @@ func decodeContinuationV1(data []byte, fields map[string]json.RawMessage) (Conti
 			return Continuation{}, continuationError("top-level field %q must not be null", name)
 		}
 	}
+	if raw, ok := fields["steps"]; ok && !isJSONNull(raw) {
+		var steps []map[string]json.RawMessage
+		if err := json.Unmarshal(raw, &steps); err != nil {
+			return Continuation{}, continuationError("decode steps: %v", err)
+		}
+		for index, step := range steps {
+			if _, exists := step["contextUsage"]; exists {
+				return Continuation{}, continuationError("version 1 step %d does not support contextUsage", index)
+			}
+		}
+	}
 
 	var wire continuationWireV1
+	if err := decodeContinuationJSON(data, &wire, true); err != nil {
+		return Continuation{}, continuationError("decode continuation: %v", err)
+	}
+	continuation := Continuation{
+		SchemaVersion: wire.SchemaVersion, Request: wire.Request, OutputPolicy: wire.OutputPolicy,
+		Messages: wire.Messages, Usage: wire.Usage, Steps: wire.Steps,
+		ToolCallsUsed: wire.ToolCallsUsed, RepairCount: wire.RepairCount,
+		ActiveElapsed: wire.ActiveElapsed, NextOperationTurn: wire.NextOperationTurn, Phase: wire.Phase,
+	}
+	normalizeContinuationContent(&continuation)
+	if err := ValidateContinuation(continuation); err != nil {
+		return Continuation{}, err
+	}
+	return cloneContinuation(continuation), nil
+}
+func decodeContinuationV2(data []byte, fields map[string]json.RawMessage) (Continuation, error) {
+	if err := validateContinuationV2Fields(fields); err != nil {
+		return Continuation{}, err
+	}
+	for _, name := range []string{
+		"schemaVersion",
+		"request",
+		"outputPolicy",
+		"usage",
+		"toolCallsUsed",
+		"repairCount",
+		"activeElapsed",
+		"nextOperationTurn",
+		"phase",
+	} {
+		if isJSONNull(fields[name]) {
+			return Continuation{}, continuationError("top-level field %q must not be null", name)
+		}
+	}
+	if raw, ok := fields["contextUsage"]; ok && isJSONNull(raw) {
+		return Continuation{}, continuationError("top-level field %q must not be null", "contextUsage")
+	}
+	if raw, ok := fields["steps"]; ok && !isJSONNull(raw) {
+		var steps []map[string]json.RawMessage
+		if err := json.Unmarshal(raw, &steps); err != nil {
+			return Continuation{}, continuationError("decode steps: %v", err)
+		}
+		for index, step := range steps {
+			if contextRaw, exists := step["contextUsage"]; exists && isJSONNull(contextRaw) {
+				return Continuation{}, continuationError("step %d contextUsage must not be null", index)
+			}
+		}
+	}
+
+	var wire continuationWireV2
 	if err := decodeContinuationJSON(data, &wire, true); err != nil {
 		return Continuation{}, continuationError("decode continuation: %v", err)
 	}
@@ -183,6 +271,27 @@ func validateContinuationV1Fields(fields map[string]json.RawMessage) error {
 	var unknown []string
 	for name := range fields {
 		if _, ok := required[name]; !ok {
+			unknown = append(unknown, name)
+		}
+	}
+	if len(unknown) > 0 {
+		sort.Strings(unknown)
+		return continuationError("unknown top-level field %q", unknown[0])
+	}
+	return nil
+}
+func validateContinuationV2Fields(fields map[string]json.RawMessage) error {
+	allowed := make(map[string]struct{}, len(continuationV1Fields)+1)
+	for _, name := range continuationV1Fields {
+		allowed[name] = struct{}{}
+		if _, ok := fields[name]; !ok {
+			return continuationError("missing top-level field %q", name)
+		}
+	}
+	allowed["contextUsage"] = struct{}{}
+	var unknown []string
+	for name := range fields {
+		if _, ok := allowed[name]; !ok {
 			unknown = append(unknown, name)
 		}
 	}

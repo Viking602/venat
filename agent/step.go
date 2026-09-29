@@ -8,14 +8,18 @@ import (
 	"github.com/Viking602/venat/provider"
 )
 
-// Step is one completed model turn in the bounded loop.
+// Step is one completed model turn in the bounded loop. ContextUsage is the
+// cumulative usage of auxiliary context-model work observed by this boundary.
 type Step struct {
 	Index        int             `json:"index"`
 	ModelCall    *ModelCall      `json:"modelCall,omitempty"`
 	ToolCalls    []ToolCallTrace `json:"toolCalls,omitempty"`
 	Observations []Observation   `json:"observations,omitempty"`
 	Decision     StepDecision    `json:"decision,omitempty"`
-	BudgetUsed   BudgetUsage     `json:"budgetUsed,omitempty"`
+	// ContextUsage is a cumulative snapshot, not a per-turn delta. It keeps
+	// summary calls attributable even when they occur between model steps.
+	ContextUsage provider.Usage `json:"contextUsage,omitzero"`
+	BudgetUsed   BudgetUsage    `json:"budgetUsed,omitempty"`
 }
 
 type ModelCall struct {

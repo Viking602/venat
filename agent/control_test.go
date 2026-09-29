@@ -232,3 +232,89 @@ func TestControl_ConcurrentSendAndFinishNeverLoseAcknowledgements(t *testing.T) 
 		}
 	}
 }
+
+func TestControl_SteerKeepsAdmissionOrderAndReceiptBoundary(t *testing.T) {
+	control := &Control{}
+	if _, finish, err := control.start(context.Background()); err != nil {
+		t.Fatal(err)
+	} else {
+		defer finish()
+	}
+	sendAck, err := control.Send(Request{Prompt: "do A"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	steerAck, err := control.Steer(Request{Prompt: "do B instead"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	followAck, err := control.FollowUp(Request{Prompt: "then summarize"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !control.continueOrSeal() {
+		t.Fatal("queued input did not request another turn")
+	}
+	messages := control.take()
+	if len(messages) != 2 || messages[0].Text != "do A" || messages[1].Text != "do B instead" {
+		t.Fatalf("admission order = %#v", messages)
+	}
+	select {
+	case <-sendAck:
+		t.Fatal("Send acknowledged before boundary")
+	default:
+	}
+	control.acknowledge(nil)
+	for _, ack := range []<-chan error{sendAck, steerAck} {
+		if err := awaitInput(t, ack); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if !control.continueOrSeal() {
+		t.Fatal("follow-up did not wait for natural completion")
+	}
+	messages = control.take()
+	if len(messages) != 1 || messages[0].Text != "then summarize" {
+		t.Fatalf("released follow-up = %#v", messages)
+	}
+	control.acknowledge(nil)
+	if err := awaitInput(t, followAck); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestControl_FollowUpWaitsForNaturalBoundary(t *testing.T) {
+	control := &Control{}
+	if _, finish, err := control.start(context.Background()); err != nil {
+		t.Fatal(err)
+	} else {
+		defer finish()
+	}
+	ack, err := control.FollowUp(Request{Prompt: "continue after this turn"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := control.take(); len(got) != 0 {
+		t.Fatalf("follow-up consumed during active turn: %#v", got)
+	}
+	if !control.continueOrSeal() {
+		t.Fatal("follow-up did not request a natural continuation")
+	}
+	got := control.take()
+	if len(got) != 1 || got[0].Text != "continue after this turn" {
+		t.Fatalf("released follow-up = %#v", got)
+	}
+	control.acknowledge(nil)
+	if err := awaitInput(t, ack); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestControl_NilReceiversRejectWithoutPanicking(t *testing.T) {
+	var control *Control
+	for _, enqueue := range []func(Request) (<-chan error, error){control.Send, control.Steer, control.FollowUp} {
+		if _, err := enqueue(Request{Prompt: "input"}); !errors.Is(err, errControlClosed) {
+			t.Fatalf("nil control error = %v", err)
+		}
+	}
+}

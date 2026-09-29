@@ -114,6 +114,7 @@ type responsesStream struct {
 	contextUsage         provider.ContextUsageObserver
 	contextUsageReported bool
 	finished             bool
+	completeToolCalls    bool
 }
 
 func (d Driver) streamResponses(ctx context.Context, request provider.Request) (provider.Stream, error) {
@@ -152,10 +153,11 @@ func (d Driver) streamResponses(ctx context.Context, request provider.Request) (
 		return nil, err
 	}
 	return &responsesStream{
-		body:         bodyStream,
-		reader:       shared.NewReader(bodyStream),
-		items:        make(map[int]*responsesOutputState),
-		contextUsage: request.ContextUsage,
+		body:              bodyStream,
+		reader:            shared.NewReader(bodyStream),
+		items:             make(map[int]*responsesOutputState),
+		contextUsage:      request.ContextUsage,
+		completeToolCalls: request.CompleteToolCalls,
 	}, nil
 }
 
@@ -302,6 +304,7 @@ var protectedResponsesModelFields = map[string]struct{}{
 }
 
 func toResponsesInput(messages []message.Message) ([]json.RawMessage, error) {
+	messages = message.ContextView(messages)
 	items := make([]json.RawMessage, 0, len(messages))
 	for _, msg := range messages {
 		var err error
@@ -638,17 +641,25 @@ func (s *responsesStream) outputItemDone(index int, item responsesOutputItem) pr
 	state := s.outputState(index)
 	hadArgumentDeltas := state.hadArgumentDeltas
 	s.recordOutputItem(index, item)
-	if item.Type != "function_call" || hadArgumentDeltas {
+	if item.Type != "function_call" {
 		return provider.Event{}
 	}
 	indexCopy := index
+	if s.completeToolCalls && state.callID != "" && state.name != "" && json.Valid([]byte(item.Arguments)) {
+		return provider.Event{
+			Kind: provider.EventToolCall,
+			ToolCall: &message.ToolCall{
+				ID: state.callID, Name: state.name, Arguments: json.RawMessage(item.Arguments),
+			},
+		}
+	}
+	if hadArgumentDeltas {
+		return provider.Event{}
+	}
 	return provider.Event{
 		Kind: provider.EventToolCallDelta,
 		ToolCallDelta: &provider.ToolCallDelta{
-			Index:          &indexCopy,
-			ID:             state.callID,
-			Name:           state.name,
-			ArgumentsDelta: item.Arguments,
+			Index: &indexCopy, ID: state.callID, Name: state.name, ArgumentsDelta: item.Arguments,
 		},
 	}
 }
@@ -759,6 +770,8 @@ func responsesError(apiError *responsesAPIError) error {
 
 func openAIErrorKind(errorType, code string) provider.ErrorKind {
 	switch {
+	case code == "context_length_exceeded" || code == "max_context_length" || code == "prompt_too_long":
+		return provider.ErrorContextLength
 	case code == "rate_limit_exceeded" || errorType == "rate_limit_error":
 		return provider.ErrorRateLimit
 	case code == "server_error" || code == "server_is_overloaded" || code == "model_error" ||

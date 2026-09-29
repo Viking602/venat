@@ -82,8 +82,11 @@ type Message struct {
 	// CacheBoundary marks the end of a stable prompt prefix at this text
 	// message. Providers with explicit prefix caching may map it to their
 	// native cache-control marker; unsupported providers may ignore it.
-	CacheBoundary bool   `json:"cacheBoundary,omitempty"`
-	Thinking      string `json:"thinking,omitempty"`
+	CacheBoundary bool `json:"cacheBoundary,omitempty"`
+	// ContextArchived retains execution evidence replaced by a working summary.
+	// Archived entries are omitted from model requests, not from transcripts.
+	ContextArchived bool   `json:"contextArchived,omitempty"`
+	Thinking        string `json:"thinking,omitempty"`
 	// ThinkingSignature is the opaque signature Anthropic attaches to a
 	// thinking block; it must be round-tripped verbatim on the next request
 	// when extended thinking is combined with tool use, or the API rejects

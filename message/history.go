@@ -161,3 +161,25 @@ func unmatchedCallIndex(calls []ToolCall, matched []bool, callIndexes map[string
 func incompleteToolTurn(index int, reason string) error {
 	return fmt.Errorf("%w: message %d: %s", ErrIncompleteToolTurn, index, reason)
 }
+
+// ContextView returns the visible model context without deleting transcript
+// evidence. Message values are borrowed; use CloneMessages before mutating them.
+// Histories without archived entries reuse the original slice.
+func ContextView(history []Message) []Message {
+	visible := 0
+	for _, current := range history {
+		if !current.ContextArchived {
+			visible++
+		}
+	}
+	if visible == len(history) {
+		return history
+	}
+	view := make([]Message, 0, visible)
+	for _, current := range history {
+		if !current.ContextArchived {
+			view = append(view, current)
+		}
+	}
+	return view
+}

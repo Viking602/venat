@@ -7,8 +7,9 @@ import (
 )
 
 // ContextManager builds the initial message slice for one Request and compacts
-// historical message lists. Implementations must be deterministic and
-// idempotent so resumed execution reproduces the same provider input.
+// historical message lists. Deterministic managers are preferred for replay;
+// model-backed managers MAY be explicitly configured with a provider/model and
+// MUST preserve complete tool turns and framework-owned context on failure.
 type ContextManager interface {
 	Build(ctx context.Context, request Request) ([]message.Message, error)
 	Compact(ctx context.Context, history []message.Message) ([]message.Message, error)

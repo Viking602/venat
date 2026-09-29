@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/Viking602/venat/message"
+	"github.com/Viking602/venat/provider"
 )
 
 func TestContinuationCodec_CanonicalRoundTrip(t *testing.T) {
@@ -95,6 +96,32 @@ func TestContinuationCodec_PreservesExecutionEnvelope(t *testing.T) {
 	}
 	if !reflect.DeepEqual(decoded.Request.SessionBudget, continuation.Request.SessionBudget) || !reflect.DeepEqual(decoded.Request.ModelTimeouts, continuation.Request.ModelTimeouts) {
 		t.Fatalf("execution envelope = %#v/%#v, want %#v/%#v", decoded.Request.SessionBudget, decoded.Request.ModelTimeouts, continuation.Request.SessionBudget, continuation.Request.ModelTimeouts)
+	}
+}
+func TestContinuationCodec_PreservesContextUsage(t *testing.T) {
+	continuation := codecReadyContinuation()
+	continuation.ContextUsage = provider.Usage{InputTokens: 3, OutputTokens: 2, TotalTokens: 5}
+	continuation.Usage = continuation.ContextUsage
+
+	encoded, err := EncodeContinuation(continuation)
+	if err != nil {
+		t.Fatalf("EncodeContinuation() error = %v", err)
+	}
+	decoded, err := DecodeContinuation(encoded)
+	if err != nil {
+		t.Fatalf("DecodeContinuation() error = %v", err)
+	}
+	if decoded.ContextUsage != continuation.ContextUsage {
+		t.Fatalf("context usage = %#v, want %#v", decoded.ContextUsage, continuation.ContextUsage)
+	}
+}
+
+func TestContinuationCodec_RejectsContextUsageAboveTotal(t *testing.T) {
+	continuation := codecReadyContinuation()
+	continuation.Usage = provider.Usage{TotalTokens: 4}
+	continuation.ContextUsage = provider.Usage{TotalTokens: 5}
+	if _, err := EncodeContinuation(continuation); !errors.Is(err, ErrInvalidContinuation) {
+		t.Fatalf("EncodeContinuation() error = %v, want ErrInvalidContinuation", err)
 	}
 }
 

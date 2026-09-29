@@ -301,6 +301,77 @@ func TestEngineRunPreparesContextAfterToolResult(t *testing.T) {
 		t.Fatalf("second CompactTo history omitted tool result: %#v", cm.histories[1])
 	}
 }
+func TestRunMessagesContextUsageBoundariesAndResume(t *testing.T) {
+	summaryUsage := provider.Usage{InputTokens: 4, OutputTokens: 1, TotalTokens: 5}
+	summariesRemaining := 2
+	summaryCalls := 0
+	compactTo := func(ctx context.Context, history []message.Message, _ int) ([]message.Message, error) {
+		if summariesRemaining > 0 {
+			summariesRemaining--
+			summaryCalls++
+			if observer := WorkingMemoryObserverFromContext(ctx); observer != nil {
+				observer(ctx, WorkingMemoryProgress{Phase: "complete", SummaryUsage: summaryUsage})
+			}
+		}
+		return history, nil
+	}
+	driver := &scriptedProvider{turns: [][]provider.Event{
+		{
+			{Kind: provider.EventToolCall, ToolCall: &message.ToolCall{
+				ID: "call-1", Name: "lookup", Arguments: json.RawMessage(`{"query":"x"}`),
+			}},
+			{Kind: provider.EventDone, StopReason: provider.StopReasonToolUse, Usage: usagePerTurn(10)},
+		},
+		{
+			{Kind: provider.EventTextDelta, Text: "done"},
+			{Kind: provider.EventDone, StopReason: provider.StopReasonComplete, Usage: usagePerTurn(10)},
+		},
+	}}
+	var ready Continuation
+	engine := newLoopToolEngine(t, driver)
+	engine.Boundaries = BoundaryObserverFunc(func(_ context.Context, continuation Continuation) error {
+		if err := ValidateContinuation(continuation); err != nil {
+			return err
+		}
+		if continuation.Phase == ContinuationReady && len(continuation.Steps) == 1 {
+			ready = cloneContinuation(continuation)
+		}
+		return nil
+	})
+	output, err := engine.RunMessages(context.Background(), LoopInput{
+		Model:              "test-model",
+		Messages:           []message.Message{message.NewText(message.RoleUser, "use a tool")},
+		ContextTokenTarget: 100,
+		CompactTo:          compactTo,
+	})
+	if err != nil {
+		t.Fatalf("RunMessages() error = %v", err)
+	}
+	if summaryCalls != 2 || output.Usage.TotalTokens != 30 {
+		t.Fatalf("summary calls=%d usage=%#v, want calls=2 total=30", summaryCalls, output.Usage)
+	}
+	if ready.Phase != ContinuationReady {
+		t.Fatalf("ready checkpoint = %#v, want between-round ready boundary", ready)
+	}
+
+	resumedDriver := &scriptedProvider{turns: [][]provider.Event{{
+		{Kind: provider.EventTextDelta, Text: "done"},
+		{Kind: provider.EventDone, StopReason: provider.StopReasonComplete, Usage: usagePerTurn(10)},
+	}}}
+	resumed := newLoopToolEngine(t, resumedDriver)
+	resumed.LoopPolicy = LoopPolicy{ContextTokenTarget: 100}
+	resumed.ContextBuilder = accountedContextBuilder{compact: compactTo}
+	resumed.Boundaries = BoundaryObserverFunc(func(_ context.Context, continuation Continuation) error {
+		return ValidateContinuation(continuation)
+	})
+	resumedResult := resumed.Resume(context.Background(), ready)
+	if resumedResult.Failure != nil || resumedResult.Usage.TotalTokens != 30 {
+		t.Fatalf("Resume() failure=%v usage=%#v, want nil and total=30", resumedResult.Failure, resumedResult.Usage)
+	}
+	if len(resumedDriver.requests) != 1 {
+		t.Fatalf("resume model calls = %d, want 1 (no summary replay)", len(resumedDriver.requests))
+	}
+}
 
 func TestEngineRunContextPreparationFailureSkipsProvider(t *testing.T) {
 	boom := errors.New("target compact boom")
@@ -377,4 +448,20 @@ func TestTargetedCompactionRejectsInPlaceCachePrefixMutation(t *testing.T) {
 	if !reflect.DeepEqual(returned, current) {
 		t.Fatalf("error path returned mutated history:\nreturned: %#v\nsource:   %#v", returned, current)
 	}
+}
+
+type accountedContextBuilder struct {
+	compact func(context.Context, []message.Message, int) ([]message.Message, error)
+}
+
+func (builder accountedContextBuilder) Build(_ context.Context, request Request) ([]message.Message, error) {
+	return []message.Message{message.NewText(message.RoleUser, request.Prompt)}, nil
+}
+
+func (builder accountedContextBuilder) Compact(ctx context.Context, history []message.Message) ([]message.Message, error) {
+	return builder.compact(ctx, history, 0)
+}
+
+func (builder accountedContextBuilder) CompactTo(ctx context.Context, history []message.Message, target int) ([]message.Message, error) {
+	return builder.compact(ctx, history, target)
 }

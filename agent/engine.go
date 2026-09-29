@@ -4,10 +4,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 	"time"
 
 	"github.com/Viking602/venat/message"
+	"github.com/Viking602/venat/provider"
 	"github.com/Viking602/venat/skill"
 	"github.com/Viking602/venat/tool"
 )
@@ -74,40 +76,42 @@ func (e Engine) run(ctx context.Context, request Request, policy OutputPolicy, s
 	maxTokens, maxToolCalls, maxSteps := e.budgetLimits(request)
 	compact, compactTo := e.compactors(runtime)
 	input := LoopInput{
-		Model:               e.Model,
-		Temperature:         e.Temperature,
-		TopP:                e.TopP,
-		ModelMaxTokens:      e.ModelMaxTokens,
-		Messages:            messages,
-		ToolMode:            e.ToolMode,
-		MaxIterations:       e.LoopPolicy.MaxIterations,
-		UnlimitedIterations: e.LoopPolicy.UnlimitedIterations,
-		MaxTokens:           maxTokens,
-		MaxToolCalls:        maxToolCalls,
-		MaxSteps:            maxSteps,
-		ModelTimeouts:       e.modelTimeouts(request),
-		ContextTokenTarget:  e.LoopPolicy.ContextTokenTarget,
-		OperationTurn:       e.OperationTurn,
-		StopSequences:       e.StopSequences,
-		ThinkingBudget:      e.ThinkingBudget,
-		ResponseFormat:      format,
-		ExtraBody:           e.ExtraBody,
-		PromptCacheKey:      e.PromptCacheKey,
-		ServiceTier:         e.ServiceTier,
-		ParallelToolCalls:   cloneBoolPointer(e.ParallelToolCalls),
-		ContextUsage:        e.ContextUsage,
-		OutputGuardrails:    e.OutputGuardrails,
-		OutputObserver:      e.OutputObserver,
-		Sink:                sink,
-		Control:             e.Control,
-		controlBound:        true,
-		StepDecider:         e.StepDecider,
-		StepObserver:        e.StepObserver,
-		Compact:             compact,
-		CompactTo:           compactTo,
-		continuationRequest: cloneRequest(request),
-		continuationPolicy:  policy,
-		segmentStarted:      started,
+		Model:                e.Model,
+		Temperature:          e.Temperature,
+		TopP:                 e.TopP,
+		ModelMaxTokens:       e.ModelMaxTokens,
+		Messages:             messages,
+		ToolMode:             e.ToolMode,
+		MaxIterations:        e.LoopPolicy.MaxIterations,
+		UnlimitedIterations:  e.LoopPolicy.UnlimitedIterations,
+		MaxTokens:            maxTokens,
+		MaxToolCalls:         maxToolCalls,
+		MaxSteps:             maxSteps,
+		ModelTimeouts:        e.modelTimeouts(request),
+		ContextTokenTarget:   e.LoopPolicy.ContextTokenTarget,
+		OperationTurn:        e.OperationTurn,
+		StopSequences:        e.StopSequences,
+		ThinkingBudget:       e.ThinkingBudget,
+		ResponseFormat:       format,
+		ExtraBody:            e.ExtraBody,
+		PromptCacheKey:       e.PromptCacheKey,
+		ServiceTier:          e.ServiceTier,
+		ParallelToolCalls:    cloneBoolPointer(e.ParallelToolCalls),
+		ContextUsage:         e.ContextUsage,
+		SafeStreamingTools:   slices.Clone(e.SafeStreamingTools),
+		ResponseContinuation: e.ResponseContinuation,
+		OutputGuardrails:     e.OutputGuardrails,
+		OutputObserver:       e.OutputObserver,
+		Sink:                 sink,
+		Control:              e.Control,
+		controlBound:         true,
+		StepDecider:          e.StepDecider,
+		StepObserver:         e.StepObserver,
+		Compact:              compact,
+		CompactTo:            compactTo,
+		continuationRequest:  cloneRequest(request),
+		continuationPolicy:   policy,
+		segmentStarted:       started,
 	}
 
 	output, runErr := e.RunMessages(runCtx, input)
@@ -319,7 +323,7 @@ func loopErrorFailure(ctx context.Context, err error, budgetDriven bool) *AgentF
 	switch {
 	case errors.Is(err, errIncompleteResponse):
 		failure.Kind = FailureKindRepairFailed
-	case errors.Is(err, errContextLimit):
+	case errors.Is(err, errContextLimit) || provider.IsContextOverflow(err):
 		failure.Kind = FailureKindContextBuildFailed
 	case errors.Is(err, ErrBudgetExhausted):
 		failure.Kind = FailureKindBudgetExhausted
@@ -342,8 +346,9 @@ func (e Engine) buildContext(ctx context.Context, request Request) ([]message.Me
 		messages []message.Message
 		err      error
 	)
-	if e.ContextBuilder != nil {
-		messages, err = e.ContextBuilder.Build(ctx, request)
+	manager := e.contextManager()
+	if manager != nil {
+		messages, err = manager.Build(ctx, request)
 	} else {
 		messages, err = defaultContextBuilder{}.Build(ctx, request)
 	}
@@ -395,12 +400,13 @@ func removeSkillContextMessages(messages []message.Message) []message.Message {
 // leave this nil so a positive ContextTokenTarget uses the default provider-view
 // fitter without erasing transcript and checkpoint evidence.
 func (e Engine) compactor(runtime *skillRuntime) func(context.Context, []message.Message) ([]message.Message, error) {
-	switch e.ContextBuilder.(type) {
+	manager := e.contextManager()
+	switch manager.(type) {
 	case nil, instructionsContext, defaultContextBuilder, ContextBuilderFunc:
 		return nil
 	}
 	return func(ctx context.Context, history []message.Message) ([]message.Message, error) {
-		compacted, err := e.ContextBuilder.Compact(ctx, history)
+		compacted, err := manager.Compact(ctx, history)
 		if err != nil {
 			return nil, err
 		}
@@ -417,7 +423,7 @@ func (e Engine) compactors(runtime *skillRuntime) (
 	func(context.Context, []message.Message, int) ([]message.Message, error),
 ) {
 	compact := e.compactor(runtime)
-	targeted, ok := e.ContextBuilder.(TargetContextManager)
+	targeted, ok := e.contextManager().(TargetContextManager)
 	if !ok {
 		return compact, nil
 	}

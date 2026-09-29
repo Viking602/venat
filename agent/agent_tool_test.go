@@ -1248,7 +1248,7 @@ func newAgentToolParallelParent(tools *tool.Bus, names []string, firstUsage, fin
 	}, &turns
 }
 
-func TestAgentTool_BoundedParentSerializesAndCapsParallelChildren(t *testing.T) {
+func TestAgentTool_BoundedParentSharesParallelChildren(t *testing.T) {
 	newConcurrentTool := func(
 		t *testing.T,
 		name string,
@@ -1281,7 +1281,7 @@ func TestAgentTool_BoundedParentSerializesAndCapsParallelChildren(t *testing.T) 
 		return driver
 	}
 
-	t.Run("bounded parent serializes a parallel batch", func(t *testing.T) {
+	t.Run("bounded parent shares a parallel batch", func(t *testing.T) {
 		release := make(chan struct{})
 		probe := &agentToolConcurrencyProbe{
 			started: make(chan string, 2),
@@ -1308,30 +1308,17 @@ func TestAgentTool_BoundedParentSerializesAndCapsParallelChildren(t *testing.T) 
 			}, OutputPolicy{})
 		}()
 
-		var first string
-		select {
-		case first = <-probe.started:
-		case <-time.After(time.Second):
-			t.Fatal("first bounded child did not start")
+		started := map[string]bool{<-probe.started: true, <-probe.started: true}
+		if !started["child-a"] || !started["child-b"] {
+			t.Fatalf("started children = %#v, want both children", started)
 		}
-		select {
-		case second := <-probe.started:
-			t.Fatalf("bounded sibling %q started while %q was running", second, first)
-		case <-time.After(50 * time.Millisecond):
+		if probe.maximum.Load() != 2 {
+			t.Fatalf("bounded max concurrency = %d, want 2", probe.maximum.Load())
 		}
 		close(release)
-		var second string
-		select {
-		case second = <-probe.started:
-		case <-time.After(time.Second):
-			t.Fatal("second bounded child did not start")
-		}
 		result := <-done
 		if result.Failure != nil {
 			t.Fatalf("parent result failure = %v", result.Failure)
-		}
-		if probe.maximum.Load() != 1 {
-			t.Fatalf("bounded max concurrency = %d, want 1", probe.maximum.Load())
 		}
 		if result.Usage.TotalTokens != 65 {
 			t.Fatalf("bounded parent usage = %#v", result.Usage)
@@ -1344,16 +1331,12 @@ func TestAgentTool_BoundedParentSerializesAndCapsParallelChildren(t *testing.T) 
 			}
 			observed[current.name] = current.budget.MaxTokens
 		}
-		if observed[first] != 90 {
-			t.Fatalf("first child %q max tokens = %d, want 90", first, observed[first])
-		}
-		wantSecond := int64(90 - usageByName[first].TotalTokens)
-		if observed[second] != wantSecond {
-			t.Fatalf("second child %q max tokens = %d, want %d", second, observed[second], wantSecond)
+		if observed["child-a"] != 45 || observed["child-b"] != 45 {
+			t.Fatalf("child budgets = %#v, want 45 each", observed)
 		}
 	})
 
-	t.Run("settlement returns unused claim before the next child", func(t *testing.T) {
+	t.Run("concurrent reservation uses short-held shares", func(t *testing.T) {
 		dispatchCtx, _ := withAgentToolDispatchContext(
 			context.Background(),
 			100,
@@ -1435,24 +1418,14 @@ func TestAgentTool_BoundedParentSerializesAndCapsParallelChildren(t *testing.T) 
 			}, nil)
 			bDone <- executeErr
 		}()
-		select {
-		case budget := <-bBudget:
-			t.Fatalf("child B started before A settled with budget %#v", budget)
-		case <-time.After(50 * time.Millisecond):
-		}
+		budgetB := <-bBudget
 		close(releaseA)
-		var observedB *Budget
-		select {
-		case observedB = <-bBudget:
-		case <-time.After(time.Second):
-			t.Fatal("child B did not start after A settled")
-		}
-		if observedB == nil ||
-			observedB.MaxTokens != 70 ||
-			observedB.MaxToolCalls != 4 ||
-			observedB.MaxSteps != 5 ||
-			observedB.MaxWallClock != time.Minute {
-			t.Fatalf("child B budget = %#v", observedB)
+		if budgetB == nil ||
+			budgetB.MaxTokens <= 0 || budgetB.MaxTokens+observedA.MaxTokens > 90 ||
+			budgetB.MaxToolCalls != 4 ||
+			budgetB.MaxSteps != 5 ||
+			budgetB.MaxWallClock != time.Minute {
+			t.Fatalf("child B budget = %#v, want concurrent share", budgetB)
 		}
 		if err := <-aDone; err != nil {
 			t.Fatalf("child A Execute() error = %v", err)
@@ -1499,70 +1472,4 @@ func TestAgentTool_BoundedParentSerializesAndCapsParallelChildren(t *testing.T) 
 		}
 	})
 
-	t.Run("exhausted pool refuses the next child before start", func(t *testing.T) {
-		var childStarts atomic.Int32
-		newExhaustingTool := func(name string) tool.Driver {
-			child := Engine{
-				Provider: agentToolProviderFunc(func(context.Context, provider.Request) (provider.Stream, error) {
-					return provider.NewSliceStream([]provider.Event{
-						{Kind: provider.EventTextDelta, Text: name + " answer"},
-						{
-							Kind:       provider.EventDone,
-							StopReason: provider.StopReasonComplete,
-							Usage:      provider.Usage{InputTokens: 12, OutputTokens: 8, TotalTokens: 20},
-						},
-					}), nil
-				}),
-				ContextBuilder: ContextBuilderFunc(func(_ context.Context, request Request) ([]message.Message, error) {
-					childStarts.Add(1)
-					return []message.Message{message.NewText(message.RoleUser, request.Prompt)}, nil
-				}),
-			}
-			driver, buildErr := NewAgentTool(child, AgentToolConfig{
-				Definition: tool.Definition{Name: name, Description: "delegate to " + name},
-			})
-			if buildErr != nil {
-				t.Fatalf("NewAgentTool(%s) error = %v", name, buildErr)
-			}
-			return driver
-		}
-		childA := newExhaustingTool("child-a")
-		childB := newExhaustingTool("child-b")
-		parent, turns := newAgentToolParallelParent(
-			tool.NewBus(childA, childB),
-			[]string{"child-a", "child-b"},
-			provider.Usage{InputTokens: 6, OutputTokens: 4, TotalTokens: 10},
-			provider.Usage{InputTokens: 1, OutputTokens: 1, TotalTokens: 2},
-		)
-		result := parent.Run(context.Background(), Request{
-			Prompt: "parallel",
-			Budget: &Budget{MaxTokens: 30},
-		}, OutputPolicy{})
-		if result.Failure == nil || result.Failure.Kind != FailureKindBudgetExhausted {
-			t.Fatalf("parent failure = %#v", result.Failure)
-		}
-		if !errors.Is(result.Failure, ErrBudgetExhausted) || !errors.Is(result.Failure, tool.ErrNotExecuted) {
-			t.Fatalf("parent failure chain = %v", result.Failure)
-		}
-		if childStarts.Load() != 1 {
-			t.Fatalf("child starts = %d, want 1", childStarts.Load())
-		}
-		if turns.Load() != 1 {
-			t.Fatalf("parent provider turns = %d, want 1", turns.Load())
-		}
-		if result.Usage.TotalTokens != 30 {
-			t.Fatalf("parent usage = %#v", result.Usage)
-		}
-		if len(result.Steps) != 1 || result.Steps[0].BudgetUsed.Tokens != 30 {
-			t.Fatalf("parent steps = %#v", result.Steps)
-		}
-		var batchErr *tool.BatchExecutionError
-		if !errors.As(result.Failure, &batchErr) || len(batchErr.Failures) != 1 {
-			t.Fatalf("batch failure = %#v", batchErr)
-		}
-		refused := batchErr.Failures[0].Err.Error()
-		if !strings.HasSuffix(refused, "refused: parent token budget exhausted") {
-			t.Fatalf("refusal error = %q", refused)
-		}
-	})
 }
