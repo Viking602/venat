@@ -38,15 +38,19 @@ func (interceptor modelAttemptInterceptor) Stream(ctx context.Context, next prov
 	if execution.Lease == nil {
 		return nil, executionRuntimeError(interceptor.active.id, ErrLeaseLost)
 	}
-	started, err := interceptor.active.runtime.backend.StartAttempt(ctx, StartAttemptRequest{
+	attemptRequest := StartAttemptRequest{
 		ExecutionID: interceptor.active.id,
 		Lease:       leaseReference(*execution.Lease),
 		OperationID: request.OperationID,
 		Kind:        AttemptKindModel,
 		InputHash:   inputHash,
-	})
+	}
+	started, err := interceptor.active.runtime.backend.StartAttempt(ctx, attemptRequest)
 	if err != nil {
 		return nil, backendOperationError("start model attempt", err)
+	}
+	if err := validateAttemptStart(attemptRequest, started); err != nil {
+		return nil, runtimeOperationError("validate model attempt", err)
 	}
 	switch started.Decision {
 	case AttemptDecisionReplay:
@@ -262,26 +266,23 @@ func (interceptor toolAttemptInterceptor) Execute(ctx context.Context, next tool
 	if execution.Lease == nil {
 		return tool.Result{}, executionRuntimeError(interceptor.active.id, ErrLeaseLost)
 	}
-	started, err := interceptor.active.runtime.backend.StartAttempt(ctx, StartAttemptRequest{
+	attemptRequest := StartAttemptRequest{
 		ExecutionID: interceptor.active.id,
 		Lease:       leaseReference(*execution.Lease),
 		OperationID: call.OperationID,
 		Kind:        AttemptKindTool,
 		InputHash:   inputHash,
-	})
+	}
+	started, err := interceptor.active.runtime.backend.StartAttempt(ctx, attemptRequest)
 	if err != nil {
 		return tool.Result{}, backendOperationError("start tool attempt", err)
 	}
+	if err := validateAttemptStart(attemptRequest, started); err != nil {
+		return tool.Result{}, runtimeOperationError("validate tool attempt", err)
+	}
 	switch started.Decision {
 	case AttemptDecisionReplay:
-		result, failure, decodeErr := decodeToolAttempt(started.Attempt.Payload)
-		if decodeErr != nil {
-			return tool.Result{}, runtimeOperationError("replay tool attempt", decodeErr)
-		}
-		if failure != nil {
-			return result, recordedFailureError(*failure)
-		}
-		return result, nil
+		return replayToolAttempt(started.Attempt, call)
 	case AttemptDecisionReconcile:
 		return tool.Result{}, interceptor.active.reconcileError([]Attempt{started.Attempt})
 	case AttemptDecisionExecute:
@@ -305,10 +306,30 @@ func (interceptor toolAttemptInterceptor) Execute(ctx context.Context, next tool
 	return result, errors.Join(executeErr, encodeErr, interceptor.active.reconcileError([]Attempt{unknown}))
 }
 
+func replayToolAttempt(attempt Attempt, call tool.Call) (tool.Result, error) {
+	result, failure, err := decodeToolAttempt(attempt.Payload)
+	if err != nil {
+		return tool.Result{}, runtimeOperationError("replay tool attempt", err)
+	}
+	if (failure == nil) != (attempt.Status == AttemptStatusSucceeded) || result.ToolCallID != call.ID || result.Name != call.Name {
+		return tool.Result{}, runtimeOperationError("validate tool replay", ErrConflict)
+	}
+	if failure != nil {
+		if attempt.Failure == nil || *failure != *attempt.Failure {
+			return tool.Result{}, runtimeOperationError("validate tool replay failure", ErrConflict)
+		}
+		return result, recordedFailureError(*failure)
+	}
+	return result, nil
+}
+
 func replayModelAttempt(attempt Attempt) (provider.Stream, error) {
 	events, failure, err := decodeModelAttempt(attempt.Payload)
 	if err != nil {
 		return nil, err
+	}
+	if (failure == nil) != (attempt.Failure == nil) || (failure != nil && *failure != *attempt.Failure) {
+		return nil, fmt.Errorf("%w: model replay failure disagrees with attempt", ErrConflict)
 	}
 	switch attempt.Status {
 	case AttemptStatusSucceeded:

@@ -60,6 +60,8 @@ Implement all 12 methods of `durable.Backend`. The application owns schema, migr
 - Lock the execution record before reading lease state or mutating any child attempt. Lock affected attempt rows in the same transaction.
 - Keep execution-version CAS independent from attempt-version CAS. Attempt mutations never advance `Execution.Version`.
 - Validate checkpoint codec, schema version, and hash before storage and after loading.
+- Compute record-bound checkpoint/result hashes using the locked execution's
+  immutable SpecHash. See [hash migration](security-hardening.md#backend-migration).
 - Return the exact committed value for a recognized response-loss retry. Never apply the transition twice.
 - Atomically convert applicable `running` attempts to `unknown` when a lease is released, suspended, expires into a later claim, or is superseded by a later claim.
 - Reject terminal execution completion while any attempt is `running` or `unknown`.
@@ -108,9 +110,10 @@ COMMIT
 Execution CAS mutation:
 
 ```text
-validate codec/hash inputs before transaction
+validate codec and bounded JSON inputs before transaction
 BEGIN
   execution = lock execution by ExecutionID
+  validate record-bound hash using execution's immutable SpecHash
   receipt = lock mutation receipt by command identity
   if receipt matches: return its complete response
   verify active lease owner/token using backend time

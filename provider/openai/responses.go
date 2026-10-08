@@ -108,6 +108,7 @@ type responsesOutputState struct {
 }
 
 type responsesStream struct {
+	budget               shared.StreamBudget
 	body                 io.ReadCloser
 	reader               *shared.Reader
 	items                map[int]*responsesOutputState
@@ -563,24 +564,51 @@ func (s *responsesStream) Recv() (provider.Event, error) {
 			}
 			return provider.Event{}, err
 		}
+		if err := s.budget.Observe(frame); err != nil {
+			s.finished = true
+			return provider.Event{}, err
+		}
 		if strings.TrimSpace(frame.Data) == "" {
 			continue
 		}
 		var event responsesStreamEvent
-		if err := json.Unmarshal([]byte(frame.Data), &event); err != nil {
+		if err := shared.DecodeStreamJSON([]byte(frame.Data), &event); err != nil {
+			s.finished = true
 			return provider.Event{}, fmt.Errorf("decode openai responses stream event: %w", err)
 		}
 		if event.Type == "" {
 			event.Type = frame.Name
 		}
+		if err := s.validateEvent(event); err != nil {
+			s.finished = true
+			return provider.Event{}, err
+		}
 		result, emit, err := s.consume(event)
 		if err != nil {
+			s.finished = true
 			return provider.Event{}, err
 		}
 		if emit {
 			return result, nil
 		}
 	}
+}
+
+func (s *responsesStream) validateEvent(event responsesStreamEvent) error {
+	if len(event.Item.Name) > message.MaxToolNameBytes {
+		return fmt.Errorf("openai responses tool name exceeds %d bytes", message.MaxToolNameBytes)
+	}
+	switch event.Type {
+	case "response.output_item.added", "response.output_item.done", "response.output_text.delta",
+		"response.refusal.delta", "response.function_call_arguments.delta":
+		if event.OutputIndex < 0 {
+			return fmt.Errorf("openai responses output index is negative")
+		}
+		if _, exists := s.items[event.OutputIndex]; !exists && len(s.items) >= shared.MaxStreamItems {
+			return fmt.Errorf("openai responses output exceeds item limit")
+		}
+	}
+	return nil
 }
 
 func (s *responsesStream) consume(event responsesStreamEvent) (provider.Event, bool, error) {
@@ -719,8 +747,13 @@ func responsesOutput(raw json.RawMessage) (json.RawMessage, []responsesOutputIte
 		return nil, nil, fmt.Errorf("openai responses terminal output must be a JSON array")
 	}
 	var output []responsesOutputItem
-	if err := json.Unmarshal(trimmed, &output); err != nil {
+	if err := shared.DecodeStreamJSON(trimmed, &output); err != nil {
 		return nil, nil, fmt.Errorf("decode openai responses terminal output: %w", err)
+	}
+	for _, item := range output {
+		if len(item.Name) > message.MaxToolNameBytes {
+			return nil, nil, fmt.Errorf("openai responses tool name exceeds %d bytes", message.MaxToolNameBytes)
+		}
 	}
 	providerState := append(json.RawMessage(nil), trimmed...)
 	return providerState, output, nil

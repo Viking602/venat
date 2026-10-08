@@ -34,6 +34,7 @@ func RunBackendContractTests(t *testing.T, factory BackendFactory) {
 		t.Run("renew release and suspend response-loss reopen", func(t *testing.T) { testLeaseMutationResponseLossReopen(t, factory) })
 	})
 	t.Run("checkpoint", func(t *testing.T) {
+		t.Run("record identity and sequence binding", func(t *testing.T) { testRecordBinding(t, factory) })
 		t.Run("CAS replacement codec hash and reopen", func(t *testing.T) { testCheckpointCASReplacementAndReopen(t, factory) })
 		t.Run("response-loss exact replay after reopen", func(t *testing.T) { testCheckpointResponseLossReopen(t, factory) })
 	})
@@ -185,7 +186,7 @@ func testCheckpointCASReplacementAndReopen(t *testing.T, factory BackendFactory)
 	created := mustStart(t, backend, "checkpoint", testSpec("checkpoint"), claimID(1), time.Second)
 	lease := reference(created.Execution)
 	contractFacts(t, "SaveCheckpoint", created.Execution.ID, created.Execution.Lease.ClaimID, lease.Token, created.Execution.Version, created.Execution.Version)
-	first := testCheckpoint(t, 1, "first")
+	first := testCheckpoint(t, created.Execution, 1, "first")
 	saved, err := backend.SaveCheckpoint(ctx, durable.SaveCheckpointRequest{ExecutionID: "checkpoint", Lease: lease, ExpectedVersion: created.Execution.Version, Checkpoint: first})
 	if err != nil {
 		t.Fatalf("SaveCheckpoint(first) error = %v", err)
@@ -197,11 +198,11 @@ func testCheckpointCASReplacementAndReopen(t *testing.T, factory BackendFactory)
 	if err != nil || !reflect.DeepEqual(exact, saved) {
 		t.Fatalf("exact SaveCheckpoint() retry = %#v, %v, want %#v", exact, err, saved)
 	}
-	conflicting := testCheckpoint(t, 1, "different")
+	conflicting := testCheckpoint(t, created.Execution, 1, "different")
 	if _, err := backend.SaveCheckpoint(ctx, durable.SaveCheckpointRequest{ExecutionID: "checkpoint", Lease: lease, ExpectedVersion: saved.Version, Checkpoint: conflicting}); !errors.Is(err, durable.ErrConflict) {
 		t.Fatalf("conflicting sequence SaveCheckpoint() error = %v, want ErrConflict", err)
 	}
-	second := testCheckpoint(t, 2, "second")
+	second := testCheckpoint(t, created.Execution, 2, "second")
 	if _, err := backend.SaveCheckpoint(ctx, durable.SaveCheckpointRequest{ExecutionID: "checkpoint", Lease: lease, ExpectedVersion: created.Execution.Version, Checkpoint: second}); !errors.Is(err, durable.ErrConflict) {
 		t.Fatalf("stale-version SaveCheckpoint() error = %v, want ErrConflict", err)
 	}
@@ -216,7 +217,7 @@ func testCheckpointCASReplacementAndReopen(t *testing.T, factory BackendFactory)
 	if err != nil || !reflect.DeepEqual(loaded, saved) {
 		t.Fatalf("reopened LoadExecution() = %#v, %v, want %#v", loaded, err, saved)
 	}
-	corrupt := testCheckpoint(t, 3, "corrupt")
+	corrupt := testCheckpoint(t, created.Execution, 3, "corrupt")
 	corrupt.ContinuationHash[0] ^= 0xff
 	if _, err := backend.SaveCheckpoint(ctx, durable.SaveCheckpointRequest{ExecutionID: "checkpoint", Lease: lease, ExpectedVersion: saved.Version, Checkpoint: corrupt}); !errors.Is(err, durable.ErrCorruptCheckpoint) {
 		t.Fatalf("corrupt SaveCheckpoint() error = %v, want ErrCorruptCheckpoint", err)
@@ -397,7 +398,7 @@ func testFinishTerminalContract(t *testing.T, factory BackendFactory) {
 	lease := reference(created.Execution)
 	uncertain := startAttempt(t, backend, "finish", lease, "turn:0:model", durable.AttemptKindModel)
 	result := agent.Result{Text: "done", Valid: true}
-	finish := durable.FinishExecutionRequest{ExecutionID: "finish", Lease: lease, ExpectedVersion: created.Execution.Version, Result: result, ResultHash: mustResultHash(t, result)}
+	finish := durable.FinishExecutionRequest{ExecutionID: "finish", Lease: lease, ExpectedVersion: created.Execution.Version, Result: result, ResultHash: mustResultHash(t, created.Execution, result)}
 	contractFacts(t, "FinishExecution", created.Execution.ID, created.Execution.Lease.ClaimID, lease.Token, finish.ExpectedVersion, created.Execution.Version)
 	if _, err := backend.FinishExecution(ctx, finish); !errors.Is(err, durable.ErrReconcileRequired) {
 		t.Fatalf("FinishExecution() with running attempt error = %v, want ErrReconcileRequired", err)
@@ -431,14 +432,14 @@ func testFinishTerminalContract(t *testing.T, factory BackendFactory) {
 	}
 	different := finish
 	different.Result = agent.Result{Text: "different"}
-	different.ResultHash = mustResultHash(t, different.Result)
+	different.ResultHash = mustResultHash(t, created.Execution, different.Result)
 	if _, err := backend.FinishExecution(ctx, different); !errors.Is(err, durable.ErrConflict) {
 		t.Fatalf("conflicting FinishExecution() error = %v, want ErrConflict", err)
 	}
 
 	failedCreated := mustStart(t, backend, "failed", testSpec("failed"), claimID(10), time.Second)
 	failedResult := agent.Result{Failure: &agent.AgentFailure{Kind: agent.FailureKindEngineError, Reason: "failed"}}
-	failed, err := backend.FinishExecution(ctx, durable.FinishExecutionRequest{ExecutionID: "failed", Lease: reference(failedCreated.Execution), ExpectedVersion: failedCreated.Execution.Version, Result: failedResult, ResultHash: mustResultHash(t, failedResult)})
+	failed, err := backend.FinishExecution(ctx, durable.FinishExecutionRequest{ExecutionID: "failed", Lease: reference(failedCreated.Execution), ExpectedVersion: failedCreated.Execution.Version, Result: failedResult, ResultHash: mustResultHash(t, failedCreated.Execution, failedResult)})
 	if err != nil || failed.Status != durable.ExecutionStatusFailed {
 		t.Fatalf("FinishExecution(failed) = %#v, %v", failed, err)
 	}
@@ -522,7 +523,7 @@ func reference(execution durable.Execution) durable.LeaseRef {
 	return durable.LeaseRef{OwnerID: execution.Lease.OwnerID, Token: execution.Lease.Token}
 }
 
-func testCheckpoint(t *testing.T, sequence uint64, prompt string) durable.Checkpoint {
+func testCheckpoint(t *testing.T, execution durable.Execution, sequence uint64, prompt string) durable.Checkpoint {
 	t.Helper()
 	continuation := agent.Continuation{
 		SchemaVersion:     agent.ContinuationSchemaVersion,
@@ -531,7 +532,7 @@ func testCheckpoint(t *testing.T, sequence uint64, prompt string) durable.Checkp
 		NextOperationTurn: 0,
 		Phase:             agent.ContinuationReady,
 	}
-	hash, err := durable.HashContinuation(continuation)
+	hash, err := durable.HashContinuation(execution.ID, execution.SpecHash, sequence, continuation)
 	if err != nil {
 		t.Fatalf("HashContinuation() error = %v", err)
 	}
@@ -557,9 +558,9 @@ func mustSpecHash(t *testing.T, spec durable.ExecutionSpec) [32]byte {
 	return hash
 }
 
-func mustResultHash(t *testing.T, result agent.Result) [32]byte {
+func mustResultHash(t *testing.T, execution durable.Execution, result agent.Result) [32]byte {
 	t.Helper()
-	hash, err := durable.HashResult(result)
+	hash, err := durable.HashResult(execution.ID, execution.SpecHash, execution.Version+1, result)
 	if err != nil {
 		t.Fatalf("HashResult() error = %v", err)
 	}

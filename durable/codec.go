@@ -6,11 +6,22 @@ import (
 	"errors"
 	"fmt"
 
+	"github.com/Viking602/venat/message"
 	"github.com/Viking602/venat/provider"
 	"github.com/Viking602/venat/tool"
 )
 
-const attemptEnvelopeVersion = 1
+const (
+	attemptEnvelopeVersion = 1
+	maxAttemptPayloadBytes = 64 << 20
+	maxAttemptEvents       = 65536
+)
+
+func validateAttemptPayload(payload []byte) error {
+	return message.CheckJSON(payload, message.JSONLimits{
+		Bytes: maxAttemptPayloadBytes, Depth: 128, Values: 524288, Collection: maxAttemptEvents,
+	})
+}
 
 type modelAttemptEnvelope struct {
 	Version int                   `json:"version"`
@@ -56,6 +67,9 @@ func cloneProviderEvent(event provider.Event) provider.Event {
 }
 
 func encodeModelAttempt(events []provider.Event, failure *FailureRecord) ([]byte, error) {
+	if len(events) > maxAttemptEvents {
+		return nil, errors.New("model attempt exceeds event limit")
+	}
 	stored := make([]storedProviderEvent, len(events))
 	version := attemptEnvelopeVersion
 	for index, event := range events {
@@ -74,10 +88,16 @@ func encodeModelAttempt(events []provider.Event, failure *FailureRecord) ([]byte
 	if err != nil {
 		return nil, fmt.Errorf("encode model attempt: %w", err)
 	}
+	if err := validateAttemptPayload(encoded); err != nil {
+		return nil, err
+	}
 	return encoded, nil
 }
 
 func decodeModelAttempt(payload []byte) ([]provider.Event, *FailureRecord, error) {
+	if err := validateAttemptPayload(payload); err != nil {
+		return nil, nil, fmt.Errorf("decode model attempt: %w", err)
+	}
 	var envelope modelAttemptEnvelope
 	if err := json.Unmarshal(payload, &envelope); err != nil {
 		return nil, nil, fmt.Errorf("decode model attempt: %w", err)
@@ -110,10 +130,16 @@ func encodeToolAttempt(result tool.Result, failure *FailureRecord) ([]byte, erro
 	if err != nil {
 		return nil, fmt.Errorf("encode tool attempt: %w", err)
 	}
+	if err := validateAttemptPayload(encoded); err != nil {
+		return nil, err
+	}
 	return encoded, nil
 }
 
 func decodeToolAttempt(payload []byte) (tool.Result, *FailureRecord, error) {
+	if err := validateAttemptPayload(payload); err != nil {
+		return tool.Result{}, nil, fmt.Errorf("decode tool attempt: %w", err)
+	}
 	var envelope toolAttemptEnvelope
 	if err := json.Unmarshal(payload, &envelope); err != nil {
 		return tool.Result{}, nil, fmt.Errorf("decode tool attempt: %w", err)

@@ -160,7 +160,7 @@ func (backend *Backend) LoadExecution(ctx context.Context, executionID durable.E
 	var execution durable.Execution
 	err := backend.withRecord(ctx, executionID, "", func(record *executionRecord, _ time.Time) error {
 		if record.execution.Checkpoint != nil {
-			if err := durable.ValidateCheckpoint(*record.execution.Checkpoint); err != nil {
+			if err := durable.ValidateCheckpoint(record.execution.ID, record.execution.SpecHash, *record.execution.Checkpoint); err != nil {
 				return executionError(executionID, err)
 			}
 		}
@@ -190,13 +190,13 @@ func (backend *Backend) SaveCheckpoint(ctx context.Context, request durable.Save
 	if !validExecutionID(request.ExecutionID) || request.Lease.OwnerID == "" || request.Lease.Token == 0 {
 		return durable.Execution{}, contextOrValidation(ctx, executionError(request.ExecutionID, durable.ErrInvalidArgument))
 	}
-	if err := durable.ValidateCheckpoint(request.Checkpoint); err != nil {
-		return durable.Execution{}, contextOrValidation(ctx, executionError(request.ExecutionID, err))
-	}
 	var execution durable.Execution
 	err := backend.withRecord(ctx, request.ExecutionID, "", func(record *executionRecord, now time.Time) error {
 		if err := requireActiveLease(record, request.ExecutionID, request.Lease, now); err != nil {
 			return err
+		}
+		if err := durable.ValidateCheckpoint(record.execution.ID, record.execution.SpecHash, request.Checkpoint); err != nil {
+			return executionError(request.ExecutionID, err)
 		}
 		if current := record.execution.Checkpoint; current != nil {
 			if current.Sequence == request.Checkpoint.Sequence {
@@ -257,15 +257,12 @@ func (backend *Backend) FinishExecution(ctx context.Context, request durable.Fin
 	if !validExecutionID(request.ExecutionID) || request.Lease.OwnerID == "" || request.Lease.Token == 0 {
 		return durable.Execution{}, contextOrValidation(ctx, executionError(request.ExecutionID, durable.ErrInvalidArgument))
 	}
-	hash, hashErr := durable.HashResult(request.Result)
-	if hashErr != nil {
-		return durable.Execution{}, contextOrValidation(ctx, executionError(request.ExecutionID, durable.ErrInvalidArgument))
-	}
-	if hash != request.ResultHash {
-		return durable.Execution{}, contextOrValidation(ctx, executionError(request.ExecutionID, durable.ErrConflict))
-	}
 	var execution durable.Execution
 	err := backend.withRecord(ctx, request.ExecutionID, "", func(record *executionRecord, now time.Time) error {
+		hash, hashErr := durable.HashResult(record.execution.ID, record.execution.SpecHash, request.ExpectedVersion+1, request.Result)
+		if hashErr != nil || hash != request.ResultHash {
+			return executionError(request.ExecutionID, durable.ErrConflict)
+		}
 		if record.nextToken > request.Lease.Token {
 			return executionError(request.ExecutionID, durable.ErrLeaseLost)
 		}

@@ -4,6 +4,15 @@ ADR-029 is a breaking clean cutover. The former platform façade and platform-ow
 
 This document may name deleted APIs for migration purposes. Current API guidance lives in [Public API](public-api.md).
 
+## Security boundary changes
+
+The 2026-10-04 scan fixes change durable hash helper signatures and stored digest
+semantics. External backends must migrate current records and response receipts,
+and rerun the backend contract suite before deployment. HTTPTool now confines
+redirects even with a custom client; `kit.Tool` rejects recursive input types;
+provider, continuation, attempt and skill parsing enforce fixed resource bounds.
+See [Security hardening](security-hardening.md) for exact limits and migration.
+
 ## Execution-completeness changes
 
 - Opt into provider JSON Schema output with `OutputPolicy.Native`; existing local
@@ -32,7 +41,8 @@ This document may name deleted APIs for migration purposes. Current API guidance
   fields should be changed to named fields. Mutable media is cloned at boundaries.
 - Use one fresh Control per execution. Queued input and persistent acknowledgement
   have different guarantees; see [Agent execution](agent-execution.md).
-- New checkpoints use v2; legacy v1 hashes stay readable. Follow the coordinated
+- New continuations use v2; legacy v1 canonical bytes stay readable. Durable
+  content-only hashes require the separate security migration above. Follow the coordinated
   reader/writer and rollback procedure in [Durable execution](durable-execution.md#wire-version-and-rollout).
 - `Request.SessionBudget` can carry cumulative token and active wall-clock limits
   through continuation and durable resume. `Request.ModelTimeouts` adds Codex-style

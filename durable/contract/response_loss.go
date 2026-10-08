@@ -148,7 +148,7 @@ func testCheckpointResponseLossReopen(t *testing.T, factory BackendFactory) {
 		ExecutionID:     created.Execution.ID,
 		Lease:           reference(created.Execution),
 		ExpectedVersion: created.Execution.Version,
-		Checkpoint:      testCheckpoint(t, 1, "checkpoint-loss"),
+		Checkpoint:      testCheckpoint(t, created.Execution, 1, "checkpoint-loss"),
 	}
 	committed, err := backend.SaveCheckpoint(context.Background(), request)
 	if err != nil {
@@ -349,7 +349,7 @@ func testFinishResponseLossReopen(t *testing.T, factory BackendFactory) {
 		Lease:           reference(created.Execution),
 		ExpectedVersion: created.Execution.Version,
 		Result:          result,
-		ResultHash:      mustResultHash(t, result),
+		ResultHash:      mustResultHash(t, created.Execution, result),
 	}
 	committed, err := backend.FinishExecution(context.Background(), request)
 	if err != nil {
@@ -371,7 +371,7 @@ func testRejectedMutationPreservesVersions(t *testing.T, factory BackendFactory)
 		lease := reference(created.Execution)
 		valid := durable.SaveCheckpointRequest{
 			ExecutionID: created.Execution.ID, Lease: lease, ExpectedVersion: created.Execution.Version,
-			Checkpoint: testCheckpoint(t, 1, "first"),
+			Checkpoint: testCheckpoint(t, created.Execution, 1, "first"),
 		}
 		saved, err := backend.SaveCheckpoint(context.Background(), valid)
 		if err != nil {
@@ -379,20 +379,20 @@ func testRejectedMutationPreservesVersions(t *testing.T, factory BackendFactory)
 		}
 		corrupt := valid
 		corrupt.ExpectedVersion = saved.Version
-		corrupt.Checkpoint = testCheckpoint(t, 2, "corrupt")
+		corrupt.Checkpoint = testCheckpoint(t, created.Execution, 2, "corrupt")
 		corrupt.Checkpoint.ContinuationHash[0] ^= 0xff
 		if _, err := backend.SaveCheckpoint(context.Background(), corrupt); !errors.Is(err, durable.ErrCorruptCheckpoint) {
 			contractFacts(t, "SaveCheckpoint", corrupt.ExecutionID, created.Execution.Lease.ClaimID, lease.Token, corrupt.ExpectedVersion, saved.Version)
 			t.Fatalf("corrupt checkpoint error = %v, want ErrCorruptCheckpoint", err)
 		}
 		stale := valid
-		stale.Checkpoint = testCheckpoint(t, 2, "stale")
+		stale.Checkpoint = testCheckpoint(t, created.Execution, 2, "stale")
 		if _, err := backend.SaveCheckpoint(context.Background(), stale); !errors.Is(err, durable.ErrConflict) {
 			t.Fatalf("stale version error = %v, want ErrConflict", err)
 		}
 		staleLease := valid
 		staleLease.ExpectedVersion = saved.Version
-		staleLease.Checkpoint = testCheckpoint(t, 2, "stale-lease")
+		staleLease.Checkpoint = testCheckpoint(t, created.Execution, 2, "stale-lease")
 		staleLease.Lease.Token++
 		if _, err := backend.SaveCheckpoint(context.Background(), staleLease); !errors.Is(err, durable.ErrLeaseLost) {
 			t.Fatalf("stale lease error = %v, want ErrLeaseLost", err)
@@ -429,7 +429,7 @@ func testRejectedMutationPreservesVersions(t *testing.T, factory BackendFactory)
 		result := agent.Result{Text: "unsafe", Valid: true}
 		request := durable.FinishExecutionRequest{
 			ExecutionID: created.Execution.ID, Lease: lease, ExpectedVersion: created.Execution.Version,
-			Result: result, ResultHash: mustResultHash(t, result),
+			Result: result, ResultHash: mustResultHash(t, created.Execution, result),
 		}
 		if _, err := backend.FinishExecution(context.Background(), request); !errors.Is(err, durable.ErrReconcileRequired) {
 			contractFacts(t, "FinishExecution", request.ExecutionID, created.Execution.Lease.ClaimID, lease.Token, request.ExpectedVersion, created.Execution.Version)

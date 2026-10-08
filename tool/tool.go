@@ -204,6 +204,9 @@ func (b *Bus) Register(driver Driver) error {
 	if definition.Name == "" {
 		return fmt.Errorf("%w: name is empty", ErrInvalidToolDefinition)
 	}
+	if len(definition.Name) > message.MaxToolNameBytes {
+		return fmt.Errorf("%w: name exceeds %d bytes", ErrInvalidToolDefinition, message.MaxToolNameBytes)
+	}
 	validation := compileArgumentValidation(definition)
 	if validation.err != nil {
 		return validation.err
@@ -388,6 +391,9 @@ func (b *Bus) Execute(ctx context.Context, call Call, options ExecuteOptions) (R
 	if err := ctx.Err(); err != nil {
 		return Result{}, errors.Join(ErrNotExecuted, err)
 	}
+	if len(call.Name) > message.MaxToolNameBytes {
+		return rejectedCall(call, fmt.Errorf("tool name exceeds %d bytes", message.MaxToolNameBytes)), nil
+	}
 	b.mu.RLock()
 	driver, ok := b.drivers[call.Name]
 	validation := b.validations[call.Name]
@@ -424,30 +430,35 @@ func (b *Bus) Execute(ctx context.Context, call Call, options ExecuteOptions) (R
 }
 
 // availableToolsHint builds the unknown-name rejection hint. Candidates are
-// ranked by nameSimilarity so the tool the model likely meant surfaces first,
+// ranked by preparedNameSimilarity so the tool the model likely meant surfaces first,
 // and strong matches are called out as a "did you mean" suggestion. Only
 // dispatchable names are disclosed: restricted or unregistered tools are never
 // named because the model cannot reach them on this bus.
 func (b *Bus) availableToolsHint(query string) string {
 	b.mu.RLock()
-	candidates := make([]Definition, 0, len(b.definitions))
+	type rankedTool struct {
+		definition Definition
+		score      float64
+	}
+	candidates := make([]rankedTool, 0, len(b.definitions))
+	normalizedQuery, queryTokens := normalizeName(query), nameTokens(query)
 	for _, definition := range b.definitions {
-		candidates = append(candidates, definition)
+		candidates = append(candidates, rankedTool{definition: definition, score: preparedNameSimilarity(normalizedQuery, queryTokens, definition)})
 	}
 	b.mu.RUnlock()
 	if len(candidates) == 0 {
 		return "no tools are registered"
 	}
 	sort.Slice(candidates, func(i, j int) bool {
-		left, right := nameSimilarity(query, candidates[i]), nameSimilarity(query, candidates[j])
+		left, right := candidates[i].score, candidates[j].score
 		if left != right {
 			return left > right
 		}
-		return candidates[i].Name < candidates[j].Name
+		return candidates[i].definition.Name < candidates[j].definition.Name
 	})
 	names := make([]string, 0, len(candidates))
 	for _, candidate := range candidates {
-		names = append(names, candidate.Name)
+		names = append(names, candidate.definition.Name)
 	}
 	const maxNamed = 12
 	list := names
@@ -458,13 +469,13 @@ func (b *Bus) availableToolsHint(query string) string {
 	if len(names) > maxNamed {
 		hint += fmt.Sprintf(", and %d more", len(names)-maxNamed)
 	}
-	if top := nameSimilarity(query, candidates[0]); top >= didYouMeanThreshold {
+	if top := candidates[0].score; top >= didYouMeanThreshold {
 		suggested := make([]string, 0, maxSuggestions)
 		for _, candidate := range candidates {
-			if len(suggested) == maxSuggestions || nameSimilarity(query, candidate) < top-0.05 {
+			if len(suggested) == maxSuggestions || candidate.score < top-0.05 {
 				break
 			}
-			suggested = append(suggested, candidate.Name)
+			suggested = append(suggested, candidate.definition.Name)
 		}
 		hint = fmt.Sprintf("did you mean: %s? %s", strings.Join(suggested, ", "), hint)
 	}
@@ -476,15 +487,15 @@ const (
 	maxSuggestions      = 3
 )
 
-// nameSimilarity scores how likely definition is the tool a rejected call
+// preparedNameSimilarity scores how likely definition is the tool a rejected call
 // meant to reach. It is a deterministic heuristic over names and descriptions,
 // never a rewrite decision. Containment catches vendor-prior names with
 // affixes (agent_update_plan -> update_plan), edit distance catches typos and
 // renames, and token overlap with the description catches training vocabulary
 // the model still reaches for (apply_patch -> edit_file whose description
 // names that tool family).
-func nameSimilarity(query string, definition Definition) float64 {
-	normalizedQuery, normalizedName := normalizeName(query), normalizeName(definition.Name)
+func preparedNameSimilarity(normalizedQuery string, queryTokens []string, definition Definition) float64 {
+	normalizedName := normalizeName(definition.Name)
 	if normalizedQuery == "" || normalizedName == "" {
 		return 0
 	}
@@ -493,7 +504,6 @@ func nameSimilarity(query string, definition Definition) float64 {
 	if strings.Contains(normalizedQuery, normalizedName) || strings.Contains(normalizedName, normalizedQuery) {
 		score = max(score, 0.8+0.2*float64(min(len(normalizedQuery), len(normalizedName)))/float64(longest))
 	}
-	queryTokens := nameTokens(query)
 	score = max(score, tokenOverlap(queryTokens, nameTokens(definition.Name)))
 	score = max(score, 0.7*tokenOverlap(queryTokens, nameTokens(definition.Description)))
 	return score
@@ -581,9 +591,13 @@ func levenshtein(left, right string) int {
 }
 
 func rejectedCall(call Call, err error) Result {
+	label := call.Name
+	if len(label) > message.MaxToolNameBytes {
+		label = label[:message.MaxToolNameBytes] + "..."
+	}
 	result := Result{
 		ToolCallID: call.ID, Name: call.Name,
-		Content: fmt.Sprintf("%s rejected: %v", call.Name, err), IsError: true,
+		Content: fmt.Sprintf("%s rejected: %v", label, err), IsError: true,
 	}
 	result.SyncLegacyContent()
 	return result

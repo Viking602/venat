@@ -142,6 +142,7 @@ type toolCallDeltaItem struct {
 }
 
 type streamState struct {
+	budget               shared.StreamBudget
 	reader               *shared.Reader
 	pending              []provider.Event
 	finished             bool
@@ -441,6 +442,10 @@ func (s *openAIStream) Recv() (provider.Event, error) {
 			}
 			return provider.Event{}, err
 		}
+		if err := s.state.budget.Observe(current); err != nil {
+			s.state.finished = true
+			return provider.Event{}, err
+		}
 		if strings.TrimSpace(current.Data) == "" {
 			continue
 		}
@@ -449,12 +454,17 @@ func (s *openAIStream) Recv() (provider.Event, error) {
 			continue
 		}
 		var parsed chunk
-		if err := json.Unmarshal([]byte(current.Data), &parsed); err != nil {
+		if err := shared.DecodeStreamJSON([]byte(current.Data), &parsed); err != nil {
+			s.state.finished = true
 			return provider.Event{}, err
 		}
 		if parsed.Error != nil {
 			s.state.finished = true
 			return provider.Event{Kind: provider.EventError, Err: responsesError(parsed.Error)}, nil
+		}
+		if err := s.validateChunk(parsed); err != nil {
+			s.state.finished = true
+			return provider.Event{}, err
 		}
 		s.consumeChunk(parsed)
 		if parsed.ID != "" {
@@ -464,6 +474,41 @@ func (s *openAIStream) Recv() (provider.Event, error) {
 			s.state.response.Model = parsed.Model
 		}
 	}
+}
+
+// Validate every choice before any delta can allocate retained tool state.
+func (s *openAIStream) validateChunk(parsed chunk) error {
+	toolItems := 0
+	indexes := make(map[int]int, len(s.state.toolCalls))
+	for index, call := range s.state.toolCalls {
+		indexes[index] = len(call.Arguments)
+	}
+	for _, choice := range parsed.Choices {
+		for _, item := range choice.Delta.ToolCalls {
+			toolItems++
+			if toolItems > shared.MaxStreamItems {
+				return fmt.Errorf("openai chunk exceeds tool item limit")
+			}
+			if len(item.Function.Name) > message.MaxToolNameBytes {
+				return fmt.Errorf("openai tool name exceeds %d bytes", message.MaxToolNameBytes)
+			}
+			index := 0
+			if item.Index != nil {
+				index = *item.Index
+			}
+			if index < 0 {
+				return fmt.Errorf("openai tool index is negative")
+			}
+			if len(item.Function.Arguments) > (1<<20)-indexes[index] {
+				return fmt.Errorf("openai tool arguments exceed byte limit")
+			}
+			indexes[index] += len(item.Function.Arguments)
+			if len(indexes) > shared.MaxStreamItems {
+				return fmt.Errorf("openai tool calls exceed item limit")
+			}
+		}
+	}
+	return nil
 }
 
 // handleDoneMarker flushes any buffered text/thinking from the splitter and
