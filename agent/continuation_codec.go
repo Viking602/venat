@@ -329,80 +329,25 @@ func canonicalizeContinuationDocument(data []byte) ([]byte, error) {
 	return json.Marshal(document)
 }
 
+const (
+	maxContinuationBytes      = 64 << 20
+	maxContinuationDepth      = 128
+	maxContinuationValues     = 524288
+	maxContinuationCollection = 65536
+)
+
 func validateContinuationJSONDocument(data []byte) error {
-	decoder := json.NewDecoder(bytes.NewReader(data))
-	decoder.UseNumber()
-	first, err := decoder.Token()
-	if err != nil {
+	if err := message.CheckJSON(data, message.JSONLimits{
+		Bytes: maxContinuationBytes, Depth: maxContinuationDepth,
+		Values: maxContinuationValues, Collection: maxContinuationCollection,
+	}); err != nil {
 		return err
 	}
-	if first != json.Delim('{') {
+	trimmed := bytes.TrimSpace(data)
+	if len(trimmed) == 0 || trimmed[0] != '{' {
 		return fmt.Errorf("top-level value must be an object")
 	}
-	if err := consumeContinuationJSONObject(decoder); err != nil {
-		return err
-	}
-	return requireContinuationJSONEnd(decoder)
-}
-
-func consumeContinuationJSONObject(decoder *json.Decoder) error {
-	seen := make(map[string]struct{})
-	for decoder.More() {
-		keyToken, err := decoder.Token()
-		if err != nil {
-			return err
-		}
-		key, ok := keyToken.(string)
-		if !ok {
-			return fmt.Errorf("object key is not a string")
-		}
-		if _, duplicate := seen[key]; duplicate {
-			return fmt.Errorf("duplicate object field %q", key)
-		}
-		seen[key] = struct{}{}
-		if err := consumeContinuationJSONValue(decoder); err != nil {
-			return err
-		}
-	}
-	closing, err := decoder.Token()
-	if err != nil {
-		return err
-	}
-	if closing != json.Delim('}') {
-		return fmt.Errorf("object has invalid closing delimiter")
-	}
 	return nil
-}
-
-func consumeContinuationJSONValue(decoder *json.Decoder) error {
-	token, err := decoder.Token()
-	if err != nil {
-		return err
-	}
-	delimiter, ok := token.(json.Delim)
-	if !ok {
-		return nil
-	}
-	switch delimiter {
-	case '{':
-		return consumeContinuationJSONObject(decoder)
-	case '[':
-		for decoder.More() {
-			if err := consumeContinuationJSONValue(decoder); err != nil {
-				return err
-			}
-		}
-		closing, err := decoder.Token()
-		if err != nil {
-			return err
-		}
-		if closing != json.Delim(']') {
-			return fmt.Errorf("array has invalid closing delimiter")
-		}
-		return nil
-	default:
-		return fmt.Errorf("unexpected JSON delimiter %q", delimiter)
-	}
 }
 
 func requireContinuationJSONEnd(decoder *json.Decoder) error {

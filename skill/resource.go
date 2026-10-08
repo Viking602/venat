@@ -3,16 +3,22 @@ package skill
 import (
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"path"
 	"sort"
 	"strings"
+	"time"
 )
 
 const (
-	maxResourceFiles = 256
-	maxResourceBytes = 8 << 20
+	maxResourceFiles         = 256
+	maxResourceBytes         = 8 << 20
+	maxResourceEntries       = 1024
+	maxResourceDepth         = 32
+	maxResourcePathBytes     = 4096
+	resourceTraversalTimeout = 5 * time.Second
 )
 
 // Resource describes one bundled file available for explicit, read-only access.
@@ -100,25 +106,71 @@ func loadResourceManifest(s *Skill, root *os.Root) error {
 		return nil
 	}
 	resources := make([]Resource, 0)
-	err := fs.WalkDir(root.FS(), ".", func(path string, entry fs.DirEntry, walkErr error) error {
-		resource, include, err := manifestResource(path, entry, walkErr)
-		if err != nil {
-			return err
-		}
-		if !include {
-			return nil
-		}
-		if len(resources) == maxResourceFiles {
-			return fmt.Errorf("skill: resource manifest exceeds %d files", maxResourceFiles)
-		}
-		resources = append(resources, resource)
-		return nil
-	})
-	if err != nil {
+	walk := resourceTraversal{root: root, deadline: time.Now().Add(resourceTraversalTimeout)}
+	if err := walk.directory(".", 0, &resources); err != nil {
 		return err
 	}
 	sort.Slice(resources, func(i, j int) bool { return resources[i].Name < resources[j].Name })
 	s.Resources = resources
+	return nil
+}
+
+type resourceTraversal struct {
+	root     *os.Root
+	deadline time.Time
+	entries  int
+}
+
+// Read directory entries in bounded batches: WalkDir would allocate every
+// sibling before our callback could enforce the total-entry limit.
+func (walk *resourceTraversal) directory(name string, depth int, resources *[]Resource) error {
+	if depth > maxResourceDepth || len(name) > maxResourcePathBytes {
+		return errors.New("skill: resource traversal exceeds depth or path limit")
+	}
+	directory, err := walk.root.Open(name)
+	if err != nil {
+		return err
+	}
+	defer directory.Close()
+	for {
+		if time.Now().After(walk.deadline) {
+			return errors.New("skill: resource traversal deadline exceeded")
+		}
+		entries, readErr := directory.ReadDir(min(64, maxResourceEntries-walk.entries+1))
+		for _, entry := range entries {
+			walk.entries++
+			if walk.entries > maxResourceEntries {
+				return errors.New("skill: resource traversal exceeds entry limit")
+			}
+			child := path.Join(name, entry.Name())
+			if err := walk.entry(child, entry, depth, resources); err != nil {
+				return err
+			}
+		}
+		if readErr != nil {
+			if errors.Is(readErr, io.EOF) {
+				return nil
+			}
+			return readErr
+		}
+	}
+}
+
+func (walk *resourceTraversal) entry(name string, entry fs.DirEntry, depth int, resources *[]Resource) error {
+	if entry.IsDir() {
+		return walk.directory(name, depth+1, resources)
+	}
+	if len(name) > maxResourcePathBytes {
+		return errors.New("skill: resource traversal exceeds path limit")
+	}
+	resource, include, err := manifestResource(name, entry, nil)
+	if err != nil || !include {
+		return err
+	}
+	if len(*resources) == maxResourceFiles {
+		return fmt.Errorf("skill: resource manifest exceeds %d files", maxResourceFiles)
+	}
+	*resources = append(*resources, resource)
 	return nil
 }
 

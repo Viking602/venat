@@ -296,51 +296,16 @@ func schemaFor(current reflect.Type) (message.JSONSchema, error) {
 }
 
 func schemaForVisited(current reflect.Type, visiting map[reflect.Type]struct{}) (message.JSONSchema, error) {
-	for current.Kind() == reflect.Pointer {
-		current = current.Elem()
+	if _, seen := visiting[current]; seen {
+		return message.JSONSchema{}, fmt.Errorf("recursive tool input type %s is unsupported; use a non-recursive input schema", current)
 	}
+	visiting[current] = struct{}{}
+	defer delete(visiting, current)
 	switch current.Kind() {
+	case reflect.Pointer:
+		return schemaForVisited(current.Elem(), visiting)
 	case reflect.Struct:
-		if _, seen := visiting[current]; seen {
-			additional := true
-			return message.JSONSchema{Type: "object", AdditionalProperties: &additional}, nil
-		}
-		visiting[current] = struct{}{}
-		defer delete(visiting, current)
-		properties := map[string]message.JSONSchema{}
-		required := make([]string, 0, current.NumField())
-		for idx := 0; idx < current.NumField(); idx++ {
-			field := current.Field(idx)
-			if !field.IsExported() {
-				continue
-			}
-			name := field.Tag.Get("json")
-			name = strings.Split(name, ",")[0]
-			if name == "" {
-				name = lowerCamel(field.Name)
-			}
-			if name == "-" {
-				continue
-			}
-			child, err := schemaForVisited(field.Type, visiting)
-			if err != nil {
-				return message.JSONSchema{}, err
-			}
-			if description := field.Tag.Get("description"); description != "" {
-				child.Description = description
-			}
-			properties[name] = child
-			if !strings.Contains(field.Tag.Get("json"), "omitempty") {
-				required = append(required, name)
-			}
-		}
-		additional := false
-		return message.JSONSchema{
-			Type:                 "object",
-			Properties:           properties,
-			Required:             required,
-			AdditionalProperties: &additional,
-		}, nil
+		return schemaForStruct(current, visiting)
 	case reflect.Slice, reflect.Array:
 		items, err := schemaForVisited(current.Elem(), visiting)
 		if err != nil {
@@ -359,6 +324,12 @@ func schemaForVisited(current reflect.Type, visiting map[reflect.Type]struct{}) 
 	case reflect.Float32, reflect.Float64:
 		return message.JSONSchema{Type: "number"}, nil
 	case reflect.Map:
+		// Map values must also be inspected: they can close a recursive graph.
+		if current.Elem().Kind() != reflect.Interface {
+			if _, err := schemaForVisited(current.Elem(), visiting); err != nil {
+				return message.JSONSchema{}, err
+			}
+		}
 		additional := true
 		return message.JSONSchema{Type: "object", AdditionalProperties: &additional}, nil
 	case reflect.String:
@@ -366,6 +337,43 @@ func schemaForVisited(current reflect.Type, visiting map[reflect.Type]struct{}) 
 	default:
 		return message.JSONSchema{}, fmt.Errorf("unsupported schema type: %s", current.Kind())
 	}
+}
+
+func schemaForStruct(current reflect.Type, visiting map[reflect.Type]struct{}) (message.JSONSchema, error) {
+	properties := map[string]message.JSONSchema{}
+	required := make([]string, 0, current.NumField())
+	for idx := 0; idx < current.NumField(); idx++ {
+		field := current.Field(idx)
+		if !field.IsExported() {
+			continue
+		}
+		name := field.Tag.Get("json")
+		name = strings.Split(name, ",")[0]
+		if name == "" {
+			name = lowerCamel(field.Name)
+		}
+		if name == "-" {
+			continue
+		}
+		child, err := schemaForVisited(field.Type, visiting)
+		if err != nil {
+			return message.JSONSchema{}, err
+		}
+		if description := field.Tag.Get("description"); description != "" {
+			child.Description = description
+		}
+		properties[name] = child
+		if !strings.Contains(field.Tag.Get("json"), "omitempty") {
+			required = append(required, name)
+		}
+	}
+	additional := false
+	return message.JSONSchema{
+		Type:                 "object",
+		Properties:           properties,
+		Required:             required,
+		AdditionalProperties: &additional,
+	}, nil
 }
 
 func lowerCamel(value string) string {

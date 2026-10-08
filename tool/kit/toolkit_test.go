@@ -117,12 +117,8 @@ func TestSchemaForRecursiveTypeDoesNotOverflow(t *testing.T) {
 		Name string `json:"name"`
 		Next *Node  `json:"next,omitempty"`
 	}
-	schema, err := schemaFor(reflect.TypeOf(Node{}))
-	if err != nil {
-		t.Fatalf("schemaFor() error = %v", err)
-	}
-	if schema.Type != "object" {
-		t.Fatalf("schema type = %q, want object", schema.Type)
+	if _, err := schemaFor(reflect.TypeOf(Node{})); err == nil || !strings.Contains(err.Error(), "recursive") {
+		t.Fatalf("schemaFor recursive type error = %v", err)
 	}
 }
 

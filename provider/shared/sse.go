@@ -26,6 +26,7 @@ type Event struct {
 // Reader incrementally parses SSE frames from a text stream.
 type Reader struct {
 	reader *bufio.Reader
+	bytes  int
 }
 
 func NewReader(body io.Reader) *Reader {
@@ -112,6 +113,10 @@ func (r *Reader) readLine() (string, error) {
 	var buf []byte
 	for {
 		chunk, err := r.reader.ReadSlice('\n')
+		if len(chunk) > MaxStreamBytes-r.bytes {
+			return "", fmt.Errorf("sse: stream exceeds %d wire bytes", MaxStreamBytes)
+		}
+		r.bytes += len(chunk)
 		if len(buf)+len(chunk) > MaxSSELineBytes {
 			return "", fmt.Errorf("sse: line exceeds %d bytes", MaxSSELineBytes)
 		}

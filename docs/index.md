@@ -17,6 +17,7 @@ Venat is a direct-import Agent SDK with an optional durable execution layer. Sta
   structured output, default context fitting, live input, and recovery receipts.
 - [Ecosystem split](ecosystem-split.md) — SDK responsibilities versus application and adapter responsibilities.
 - [Breaking migration](migration.md) — move from the former platform surface to direct package composition.
+- [Security hardening](security-hardening.md) — scan fixes, resource bounds and durable hash migration.
 
 ## Project records
 

@@ -7,9 +7,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"net/http"
 	"os"
 	"os/exec"
+	"strings"
 	"sync"
 	"time"
 
@@ -32,6 +34,8 @@ type HTTPToolConfig struct {
 }
 
 func HTTPTool(name string, schema tool.Schema, cfg HTTPToolConfig, options ...ToolOption) tool.Driver {
+	cfg.Headers = maps.Clone(cfg.Headers)
+	client := confinedHTTPClient(cfg.Client)
 	config := toolConfig{}
 	for _, option := range options {
 		option(&config)
@@ -43,10 +47,6 @@ func HTTPTool(name string, schema tool.Schema, cfg HTTPToolConfig, options ...To
 				var cancel context.CancelFunc
 				ctx, cancel = context.WithTimeout(ctx, defaultHTTPTimeout)
 				defer cancel()
-			}
-			client := cfg.Client
-			if client == nil {
-				client = &http.Client{Timeout: defaultHTTPTimeout}
 			}
 			method := cfg.Method
 			if method == "" {
@@ -81,6 +81,42 @@ func HTTPTool(name string, schema tool.Schema, cfg HTTPToolConfig, options ...To
 		},
 	}
 	return driver
+}
+
+// Copy the caller's client so every redirect is confined before its custom
+// policy runs, without mutating a client shared by other operations.
+func confinedHTTPClient(configured *http.Client) *http.Client {
+	client := &http.Client{Timeout: defaultHTTPTimeout}
+	if configured != nil {
+		*client = *configured
+	}
+	check := client.CheckRedirect
+	client.CheckRedirect = func(request *http.Request, via []*http.Request) error {
+		if len(via) >= 10 {
+			return errors.New("HTTPTool: stopped after 10 redirects")
+		}
+		if len(via) == 0 || request == nil || request.URL == nil || via[0] == nil || via[0].URL == nil {
+			return errors.New("HTTPTool: invalid redirect")
+		}
+		scheme, host := via[0].URL.Scheme, via[0].URL.Host
+		if !sameHTTPOrigin(request, scheme, host) {
+			return errors.New("HTTPTool: cross-origin redirect rejected")
+		}
+		if check != nil {
+			if err := check(request, via); err != nil {
+				return err
+			}
+		}
+		if !sameHTTPOrigin(request, scheme, host) {
+			return errors.New("HTTPTool: custom redirect policy changed origin")
+		}
+		return nil
+	}
+	return client
+}
+
+func sameHTTPOrigin(request *http.Request, scheme, host string) bool {
+	return request.URL != nil && strings.EqualFold(scheme, request.URL.Scheme) && strings.EqualFold(host, request.URL.Host)
 }
 
 // ProcessToolConfig describes an unsandboxed local process. This helper does

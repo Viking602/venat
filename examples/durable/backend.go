@@ -132,15 +132,15 @@ func (backend *exampleBackend) SaveCheckpoint(ctx context.Context, request durab
 	if err := ctx.Err(); err != nil {
 		return durable.Execution{}, err
 	}
-	if err := durable.ValidateCheckpoint(request.Checkpoint); err != nil {
-		return durable.Execution{}, executionError(request.ExecutionID, err)
-	}
 	backend.state.mu.Lock()
 	defer backend.state.mu.Unlock()
 	if err := backend.requireLease(request.ExecutionID, request.Lease); err != nil {
 		return durable.Execution{}, err
 	}
 	execution := backend.state.execution
+	if err := durable.ValidateCheckpoint(execution.ID, execution.SpecHash, request.Checkpoint); err != nil {
+		return durable.Execution{}, executionError(request.ExecutionID, err)
+	}
 	if execution.Checkpoint != nil && execution.Checkpoint.Sequence == request.Checkpoint.Sequence {
 		if execution.Checkpoint.ContinuationHash == request.Checkpoint.ContinuationHash {
 			return copyValue(*execution), nil
@@ -179,14 +179,14 @@ func (backend *exampleBackend) FinishExecution(ctx context.Context, request dura
 	if err := ctx.Err(); err != nil {
 		return durable.Execution{}, err
 	}
-	hash, err := durable.HashResult(request.Result)
-	if err != nil || hash != request.ResultHash {
-		return durable.Execution{}, executionError(request.ExecutionID, durable.ErrConflict)
-	}
 	backend.state.mu.Lock()
 	defer backend.state.mu.Unlock()
 	if err := backend.requireLease(request.ExecutionID, request.Lease); err != nil {
 		return durable.Execution{}, err
+	}
+	hash, err := durable.HashResult(request.ExecutionID, backend.state.execution.SpecHash, request.ExpectedVersion+1, request.Result)
+	if err != nil || hash != request.ResultHash {
+		return durable.Execution{}, executionError(request.ExecutionID, durable.ErrConflict)
 	}
 	if backend.state.execution.Version != request.ExpectedVersion {
 		return durable.Execution{}, executionError(request.ExecutionID, durable.ErrConflict)
@@ -351,7 +351,7 @@ func (backend *exampleBackend) LoadExecution(ctx context.Context, executionID du
 		return durable.Execution{}, executionError(executionID, durable.ErrNotFound)
 	}
 	if backend.state.execution.Checkpoint != nil {
-		if err := durable.ValidateCheckpoint(*backend.state.execution.Checkpoint); err != nil {
+		if err := durable.ValidateCheckpoint(backend.state.execution.ID, backend.state.execution.SpecHash, *backend.state.execution.Checkpoint); err != nil {
 			return durable.Execution{}, executionError(executionID, err)
 		}
 	}

@@ -150,6 +150,8 @@ type anthropicProviderState struct {
 }
 
 type streamState struct {
+	budget             shared.StreamBudget
+	citations          int
 	reader             *shared.Reader
 	pending            []provider.Event
 	finished           bool
@@ -402,6 +404,10 @@ func (s *anthropicStream) Recv() (provider.Event, error) {
 			s.state.truncated = io.ErrUnexpectedEOF
 			continue
 		}
+		if err := s.state.budget.Observe(current); err != nil {
+			s.state.finished = true
+			return provider.Event{}, err
+		}
 		truncated := readErr == io.ErrUnexpectedEOF
 		if strings.TrimSpace(current.Data) == "" {
 			if truncated {
@@ -410,13 +416,18 @@ func (s *anthropicStream) Recv() (provider.Event, error) {
 			continue
 		}
 		var parsed eventEnvelope
-		if err := json.Unmarshal([]byte(current.Data), &parsed); err != nil {
+		if err := shared.DecodeStreamJSON([]byte(current.Data), &parsed); err != nil {
+			s.state.finished = true
 			if truncated {
 				// Partial JSON from a cut connection: surface the truncation
 				// error, not a decode error, so OpenRetryingStream can
 				// classify the failure as retryable.
 				return provider.Event{}, io.ErrUnexpectedEOF
 			}
+			return provider.Event{}, err
+		}
+		if err := s.validateEnvelope(parsed); err != nil {
+			s.state.finished = true
 			return provider.Event{}, err
 		}
 		event, emit, err := s.consume(parsed)
@@ -436,6 +447,30 @@ func (s *anthropicStream) Recv() (provider.Event, error) {
 			s.state.truncated = io.ErrUnexpectedEOF
 		}
 	}
+}
+
+func (s *anthropicStream) validateEnvelope(parsed eventEnvelope) error {
+	if len(parsed.ContentBlock.Name) > message.MaxToolNameBytes {
+		return fmt.Errorf("anthropic tool name exceeds %d bytes", message.MaxToolNameBytes)
+	}
+	switch parsed.Type {
+	case "content_block_start", "content_block_delta", "content_block_stop":
+		if parsed.Index < 0 {
+			return fmt.Errorf("anthropic block index is negative")
+		}
+		if _, exists := s.state.blocks[parsed.Index]; !exists && len(s.state.blocks) >= shared.MaxStreamItems {
+			return fmt.Errorf("anthropic blocks exceed item limit")
+		}
+	}
+	citations := len(parsed.ContentBlock.Citations)
+	if parsed.Delta.Type == "citations_delta" && len(parsed.Delta.Citation) > 0 {
+		citations++
+	}
+	if citations > shared.MaxStreamItems-s.state.citations {
+		return fmt.Errorf("anthropic citations exceed item limit")
+	}
+	s.state.citations += citations
+	return nil
 }
 
 // consume handles one decoded SSE envelope. The boolean reports a terminal

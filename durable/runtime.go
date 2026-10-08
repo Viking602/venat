@@ -142,8 +142,8 @@ func (runtime *Runtime) start(ctx context.Context, executionID ExecutionID, engi
 	if claimErr != nil {
 		return agent.Result{}, backendExecutionOperationError("start execution", executionID, claimErr)
 	}
-	if validationErr := validateClaimedExecution(claimed.Execution, executionID, runtime.ownerID); validationErr != nil {
-		return agent.Result{}, runtime.rejectInvalidClaim(active, claimed.Execution, validationErr)
+	if validationErr := validateClaimedExecution(claimed.Execution, executionID, runtime.ownerID, claimID, specHash); validationErr != nil {
+		return agent.Result{}, runtime.rejectInvalidClaim(active, claimed.Execution, claimID, validationErr)
 	}
 	active.setExecution(claimed.Execution)
 	result, runErr, controlErr = runtime.runClaimed(active, engine, sink, claimed.Execution, claimed.Reconcile, ResumeTarget{})
@@ -202,8 +202,8 @@ func (runtime *Runtime) resume(ctx context.Context, executionID ExecutionID, eng
 	if claimErr != nil {
 		return agent.Result{}, backendExecutionOperationError("resume execution", executionID, claimErr)
 	}
-	if validationErr := validateClaimedExecution(claimed.Execution, executionID, runtime.ownerID); validationErr != nil {
-		return agent.Result{}, runtime.rejectInvalidClaim(active, claimed.Execution, validationErr)
+	if validationErr := validateClaimedExecution(claimed.Execution, executionID, runtime.ownerID, claimID, [32]byte{}); validationErr != nil {
+		return agent.Result{}, runtime.rejectInvalidClaim(active, claimed.Execution, claimID, validationErr)
 	}
 	active.setExecution(claimed.Execution)
 	result, runErr, controlErr = runtime.runClaimed(active, engine, sink, claimed.Execution, claimed.Reconcile, options.Target)
@@ -217,7 +217,7 @@ func (runtime *Runtime) runClaimed(active *activeExecution, engine agent.Engine,
 			return agent.Result{}, err, err
 		}
 		result := cloneAgentResult(*execution.Result)
-		hash, err := HashResult(result)
+		hash, err := HashResult(execution.ID, execution.SpecHash, execution.Version, result)
 		if err != nil || hash != execution.ResultHash {
 			failure := executionRuntimeError(execution.ID, ErrConflict)
 			return agent.Result{}, failure, failure
@@ -307,7 +307,7 @@ func (runtime *Runtime) complete(active *activeExecution, result agent.Result) (
 		err := executionRuntimeError(active.id, ErrLeaseLost)
 		return result, err, err
 	}
-	resultHash, err := HashResult(result)
+	resultHash, err := HashResult(execution.ID, execution.SpecHash, execution.Version+1, result)
 	if err != nil {
 		cleanupErr := runtime.release(active)
 		operationErr := fmt.Errorf("hash terminal result: %w", err)
@@ -324,6 +324,10 @@ func (runtime *Runtime) complete(active *activeExecution, result agent.Result) (
 		cleanupErr := runtime.release(active)
 		operationErr := backendOperationError("finish execution", err)
 		return result, errors.Join(operationErr, cleanupErr), cleanupErr
+	}
+	if validationErr := validateFinishedExecution(execution, finished, resultHash); validationErr != nil {
+		cleanupErr := runtime.release(active)
+		return result, errors.Join(validationErr, cleanupErr), cleanupErr
 	}
 	active.setExecution(finished)
 	return result, nil, nil
@@ -509,9 +513,15 @@ func validateRuntimeCall(ctx context.Context, executionID ExecutionID) error {
 	return nil
 }
 
-func validateClaimedExecution(execution Execution, executionID ExecutionID, ownerID string) error {
+func validateClaimedExecution(execution Execution, executionID ExecutionID, ownerID string, claimID ClaimID, expectedSpecHash [32]byte) error {
 	if execution.ID != executionID {
 		return claimedExecutionConflict(executionID, "backend returned a different execution ID")
+	}
+	if expectedSpecHash != ([32]byte{}) && execution.SpecHash != expectedSpecHash {
+		return claimedExecutionConflict(executionID, "backend returned a different execution spec")
+	}
+	if execution.Lease != nil && execution.Lease.ClaimID != claimID {
+		return claimedExecutionConflict(executionID, "backend returned a different claim ID")
 	}
 	if execution.Version == 0 {
 		return claimedExecutionConflict(executionID, "backend returned a zero execution version")
@@ -542,7 +552,7 @@ func validateClaimedExecutionStatus(execution Execution, executionID ExecutionID
 		if execution.Lease != nil || execution.Result == nil {
 			return claimedExecutionConflict(executionID, "terminal execution has an invalid lease or result")
 		}
-		resultHash, err := HashResult(*execution.Result)
+		resultHash, err := HashResult(execution.ID, execution.SpecHash, execution.Version, *execution.Result)
 		if err != nil || resultHash != execution.ResultHash {
 			return claimedExecutionConflict(executionID, "terminal result hash mismatch")
 		}
@@ -559,7 +569,7 @@ func validateExecutionCheckpoint(execution Execution, executionID ExecutionID) e
 	if execution.Checkpoint == nil {
 		return nil
 	}
-	if err := ValidateCheckpoint(*execution.Checkpoint); err != nil {
+	if err := ValidateCheckpoint(execution.ID, execution.SpecHash, *execution.Checkpoint); err != nil {
 		return executionRuntimeError(executionID, err)
 	}
 	return nil
@@ -569,8 +579,8 @@ func claimedExecutionConflict(executionID ExecutionID, reason string) error {
 	return executionRuntimeError(executionID, fmt.Errorf("%w: %s", ErrConflict, reason))
 }
 
-func (runtime *Runtime) rejectInvalidClaim(active *activeExecution, execution Execution, validationErr error) error {
-	if execution.Lease == nil {
+func (runtime *Runtime) rejectInvalidClaim(active *activeExecution, execution Execution, claimID ClaimID, validationErr error) error {
+	if execution.ID != active.id || execution.Lease == nil || execution.Lease.OwnerID != runtime.ownerID || execution.Lease.ClaimID != claimID || execution.Lease.Token == 0 {
 		return validationErr
 	}
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(active.callerCtx), runtime.settlementTimeout)

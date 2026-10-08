@@ -10,7 +10,7 @@ For command-error correction, working memory, tool-output retrieval, live input,
 and task verification, see [Agent execution](docs/agent-execution.md).
 The credential-free examples below exercise real execution paths with local providers.
 
-> **Status:** The latest published release is [v0.17.0](https://github.com/Viking602/venat/releases/tag/v0.17.0). Public APIs may change before v1.0.
+> **Status:** The latest published release is [v0.19.0](https://github.com/Viking602/venat/releases/tag/v0.19.0). Public APIs may change before v1.0. This version changes Durable hash helper signatures and stored digests; see the [backend migration](docs/security-hardening.md#backend-migration).
 
 ## Packages
 

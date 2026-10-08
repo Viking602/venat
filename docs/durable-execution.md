@@ -42,7 +42,12 @@ The Agent emits a complete `agent.Continuation` at safe phases:
 3. `tools_complete` — the corresponding tool-result turn is complete.
 4. `validating_output` — terminal assistant output is ready for output processing.
 
-A checkpoint has a strictly increasing sequence and a canonical content hash. Saving it fully replaces the prior continuation. A backend and runtime both reject malformed or hash-mismatched state with `ErrCorruptCheckpoint`; neither merges or repairs it.
+A checkpoint has a strictly increasing sequence and a canonical hash bound to
+its ExecutionID, immutable SpecHash and sequence. Saving it fully replaces the
+prior continuation. A backend and runtime both reject malformed or
+hash-mismatched state with `ErrCorruptCheckpoint`; neither merges or repairs it.
+See [Security hardening](security-hardening.md#backend-migration) for the changed
+hash signatures and migration of legacy records and response receipts.
 
 `Resume` calls `Engine.Resume` when a checkpoint exists and `Engine.Run` otherwise.
 
@@ -73,7 +78,7 @@ content and the native-output opt-in. The strict decoder accepts versions 1 and
 fields even when smuggled into a v1 document. There is no v0 translator.
 
 Version 1 documents retain their original version and canonical bytes on decode
-and re-encode, so existing SHA-256 checkpoint hashes remain valid. The immutable
+and re-encode, independently of the durable record hash envelope. The immutable
 `agent/testdata/continuation-v1.json` fixture covers this guarantee. Resume first
 validates the stored checkpoint and hash, then performs a pure private in-memory
 upgrade. The next safe boundary writes the v2 continuation and matching hash
@@ -124,6 +129,10 @@ turn:<n>:call:<i>
 
 Attempts have their own numbers and versions so parallel tool slots do not contend on execution checkpoint versions.
 
+The Runtime validates returned attempt identity and decision-specific state
+against the exact request before executing, replaying or reconciling. Claimed
+leases must match the issued ClaimID; Start also requires the requested SpecHash.
+
 ### Known outcome
 
 The provider wrapper persists the complete event sequence after receiving the first legal terminal event and before returning that terminal event to the Agent. A tool outcome is persisted before its result returns through the bus.
@@ -168,6 +177,11 @@ Reconciliation never runs the Engine and never claims the execution. The applica
 The runtime commits terminal status only when the Engine result contains no runtime infrastructure failure and every effect is settled. Ordinary `agent.AgentFailure` remains result data and produces a failed terminal execution.
 
 Infrastructure paths return a Go error and the partial `agent.Result` available at that point. Callers must treat a result as a terminal durable outcome only when the error is nil.
+
+A nil FinishExecution backend error is followed by returned-state validation:
+exact execution/spec identity, `ExpectedVersion+1`, terminal status, cleared
+lease, result and bound hash must all agree. Invalid responses return an
+infrastructure error with the local partial result.
 
 ## Cancellation, suspension, and close
 

@@ -14,10 +14,6 @@ func (observer boundaryObserver) ObserveBoundary(ctx context.Context, continuati
 	if cause := observer.active.stopCauseValue(); cause != nil {
 		return cause
 	}
-	hash, err := HashContinuation(continuation)
-	if err != nil {
-		return runtimeOperationError("hash continuation", err)
-	}
 	execution := observer.active.snapshot()
 	if execution.Lease == nil {
 		return executionRuntimeError(observer.active.id, ErrLeaseLost)
@@ -28,6 +24,10 @@ func (observer boundaryObserver) ObserveBoundary(ctx context.Context, continuati
 		if sequence == 0 {
 			return executionRuntimeError(observer.active.id, ErrConflict)
 		}
+	}
+	hash, err := HashContinuation(execution.ID, execution.SpecHash, sequence, continuation)
+	if err != nil {
+		return runtimeOperationError("hash continuation", err)
 	}
 	saved, err := observer.active.runtime.backend.SaveCheckpoint(ctx, SaveCheckpointRequest{
 		ExecutionID:     observer.active.id,
