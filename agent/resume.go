@@ -61,6 +61,12 @@ func (e Engine) resume(ctx context.Context, continuation Continuation, sink Sink
 	if err != nil {
 		return resultWithFailure(runCtx, continuationResult(continuation), err, budgetDriven)
 	}
+	if e.OutputStore != nil {
+		e.Tools, err = attachOutputStoreTools(e.Tools, e.OutputStore)
+		if err != nil {
+			return resultWithFailure(runCtx, continuationResult(continuation), err, budgetDriven)
+		}
+	}
 	runtime.restoreActivations(continuation.Messages)
 	compact, compactTo := e.compactors(runtime)
 	maxTokens, maxToolCalls, maxSteps := e.budgetLimits(continuation.Request)
@@ -227,6 +233,7 @@ func continuationOutput(continuation Continuation) LoopOutput {
 		RepairCount:       continuation.RepairCount,
 		ActiveElapsed:     continuation.ActiveElapsed,
 		NextOperationTurn: continuation.NextOperationTurn,
+		contextUsage:      continuation.ContextUsage,
 	}
 }
 
@@ -234,6 +241,9 @@ func decorateResumedOutput(output LoopOutput, input LoopInput) LoopOutput {
 	output.NextOperationTurn = input.OperationTurn
 	output.RepairCount = input.repairCount
 	output.ActiveElapsed = input.activeElapsed + time.Since(input.segmentStarted)
+	if input.contextUsage != nil {
+		output.contextUsage = *input.contextUsage
+	}
 	return output
 }
 

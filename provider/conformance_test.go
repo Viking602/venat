@@ -83,6 +83,19 @@ func TestNormalizeEventsConformanceCases(t *testing.T) {
 			},
 		},
 		{
+			name: "trailing delta after complete call with arguments is ignored",
+			events: []Event{
+				{Kind: EventToolCall, ToolCall: &message.ToolCall{ID: "call-1", Name: "lookup", Arguments: json.RawMessage(`{"q":"venat"}`)}},
+				{Kind: EventToolCallDelta, ToolCallDelta: &ToolCallDelta{ID: "call-1", ArgumentsDelta: `{"q":"venat"}`}},
+				{Kind: EventDone, StopReason: StopReasonToolUse},
+			},
+			assertion: func(t *testing.T, response NormalizedResponse) {
+				if len(response.ToolCalls) != 1 || string(response.ToolCalls[0].Arguments) != `{"q":"venat"}` {
+					t.Fatalf("unexpected response %#v", response)
+				}
+			},
+		},
+		{
 			name: "invalid json delta",
 			events: []Event{
 				{Kind: EventToolCallDelta, ToolCallDelta: &ToolCallDelta{ID: "call-1", Name: "lookup", ArgumentsDelta: "{\"q\":"}},

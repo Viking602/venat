@@ -132,6 +132,20 @@ func TestValidateCompleteTurns(t *testing.T) {
 			wantReason: "duplicate or unmatched tool result",
 		},
 		{
+			name: "duplicate known result ID does not consume empty call ID",
+			messages: []Message{
+				assistantToolMessage(
+					ToolCall{ID: "", Name: "first"},
+					ToolCall{ID: "call-2", Name: "second"},
+				),
+				toolResultMessage("call-2", "second"),
+				toolResultMessage("call-2", "second"),
+			},
+			wantErr:    true,
+			wantIndex:  2,
+			wantReason: "duplicate or unmatched tool result",
+		},
+		{
 			name: "missing result before non-tool message",
 			messages: []Message{
 				assistantToolMessage(

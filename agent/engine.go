@@ -176,6 +176,7 @@ func (e Engine) validateAndRepairStructuredOutput(ctx context.Context, input Loo
 		repairInput.Messages = append(message.CloneMessages(output.Messages), repairInstructionMessage(policy.Schema, validationErr))
 		repairInput.OperationTurn = output.NextOperationTurn
 		repairInput.initialUsage = output.Usage
+		repairInput.initialContextUsage = output.contextUsage
 		repairInput.initialSteps = cloneSteps(output.Steps)
 		if len(repairInput.initialSteps) > 0 {
 			repairInput.initialSteps[len(repairInput.initialSteps)-1].Decision = StepDecisionContinue

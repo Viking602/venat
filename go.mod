@@ -2,7 +2,7 @@ module github.com/Viking602/venat
 
 go 1.25.0
 
-toolchain go1.25.13
+toolchain go1.26.9
 
 retract v0.10.0 // Published from a reused tag; its public checksum cannot verify.
 

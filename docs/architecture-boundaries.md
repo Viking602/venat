@@ -1,6 +1,6 @@
 # Architecture boundaries
 
-The production package graph remains one-way. The practical-runtime extension adds model-backed memory, local output artifacts, and in-memory worker collaboration within the existing families; historical SDK-only exclusions in ADR-029 do not exclude these implemented capabilities.
+The production package graph remains one-way. The core SDK provides model-backed working memory, local output artifacts, synchronous subagent tools, and executable completion checks within the five core package families.
 
 ## Package graph
 
@@ -11,8 +11,6 @@ message      skill
    └── tool    │
         \      /
           agent
-         /     \
-orchestration  durable
 ```
 
 Allowed project imports by package scope:
@@ -24,21 +22,17 @@ Allowed project imports by package scope:
 | `tool` | `tool`, `message` |
 | `skill` | `skill` |
 | `agent` | `agent`, `message`, `provider`, `tool`, `skill` |
-| `orchestration` | `orchestration`, `agent`, `message`, `provider`, `tool` |
-| `durable` | `durable`, `agent`, `message`, `provider`, `tool` |
 
 Subpackages may import their own package family. Tests follow the same graph; an external test package may import the package it tests.
 
 ## Consequences
 
 - `message`, `provider`, `tool`, and `skill` remain leaf contracts.
-- `agent` owns the model/tool loop, optional working memory, output artifacts, and completion checks; it does not own a multi-agent scheduler or persistence backend.
-- `orchestration` depends inward on Agent, provider, and tool values for live workers and task tools, never on durability.
-- `durable` depends inward on Agent and effect contracts and never on orchestration.
-- Applications are the composition root. They map routes to engines, persist orchestration state when needed, and inject a durable backend when needed.
+- `agent` owns the model/tool loop, continuation codec, optional working memory, output artifacts, synchronous subagents, and completion checks; it does not own a multi-agent scheduler or persistence backend.
+- Applications are the composition root. They map routes to engines, schedule multi-agent workflows, and own persistence schemas, leases, and recovery policies.
 - Protocol adapters and domain integrations stay in application or ecosystem modules unless they implement an approved package-family extension.
 - Provider pull streams and tool push updates remain domain-specific under ADR-030; do not introduce a generic stream package or competing tool driver protocol.
-- Local OutputStore persistence is tool-output retrieval, not an application execution database. In-memory Runtime tasks are independently addressable but do not claim crash recovery.
+- Local OutputStore persistence is tool-output retrieval, not an application execution database.
 - Summary and streaming features must perform useful work through existing model/tool contracts; an extension interface alone is not a completed feature.
 
 ## Executable enforcement
@@ -55,7 +49,7 @@ Each package scope must exist and contain production Go source. Deleting a direc
 
 ## Public API shape
 
-Exported functions must not return `[]any`. Exported fields containing `any` require `// godoc-allow-any` immediately above the field. A genuinely open function result requires `//venat:allow-public-any` immediately above the declaration. The exception must identify a real provider, host payload, or JSON Schema boundary; convenience is not sufficient.
+Exported functions must not return `[]any`. Exported fields containing `any` (including the `interface{}` spelling) require a standalone `// godoc-allow-any` comment line, optionally followed by `: reason`, immediately above the field; a trailing comment on another line does not count. A genuinely open function result requires `//venat:allow-public-any` immediately above the declaration. The exception must identify a real provider, host payload, or JSON Schema boundary; convenience is not sufficient.
 
 ## Demand-driven extension
 

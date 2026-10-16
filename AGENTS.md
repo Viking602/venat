@@ -11,10 +11,8 @@ Venat is a typed Agent SDK for Go (`github.com/Viking602/venat`, Go 1.25). The p
 - `tool/` — typed tool drivers, bus, validation, interceptors, and application-neutral helpers
 - `skill/` — reusable instruction resources and discovery
 - `agent/` — one bounded Agent loop, hooks, outputs, continuation, and resume
-- `orchestration/` — pure scheduling protocol and bounded mechanical dispatch drive
-- `durable/` — optional execution backend contract, runtime, effect settlement, and reconciliation
 
-Supporting surfaces are `durable/contract`, `examples/`, `scripts/`, and `docs/`. Applications are the composition root and own identity, routing policy, schema, deployment, and operations. See `docs/architecture-boundaries.md` and ADR-029.
+Supporting surfaces are `examples/`, `scripts/`, and `docs/`. Applications are the composition root and own identity, routing policy, orchestration, persistence schema, deployment, and operations. See `docs/architecture-boundaries.md` and ADR-031.
 
 ## Build, test, and development commands
 
@@ -24,14 +22,14 @@ Supporting surfaces are `durable/contract`, `examples/`, `scripts/`, and `docs/`
 - `make test` / `make test-race` — normal or race-enabled package tests.
 - `make architecture-check` — Sentrux plus vocabulary, public-shape, import-boundary, and removed-surface gates.
 - `go run ./examples/agent`
-- `go run ./examples/orchestration`
-- `go run ./examples/durable`
+- `go run ./examples/subagent`
+- `go run ./examples/interactive`
 
 Run `make verify` before routine changes and `make ci-local` before substantial changes.
 
 ## Public any-field contract
 
-Exported functions in `message/`, `provider/`, `tool/`, `skill/`, `agent/`, `orchestration/`, and `durable/` must not return `[]any`; exported fields must not contain loose `any`.
+Exported functions in `message/`, `provider/`, `tool/`, `skill/`, and `agent/` must not return `[]any`; exported fields must not contain loose `any`.
 
 Genuine provider bodies, host payloads, or JSON Schema objects require an escape-hatch comment on the immediately preceding line:
 
@@ -58,24 +56,18 @@ Focused suites:
 
 ```bash
 go test ./agent ./message ./provider/... ./tool/... ./skill/...
-go test ./orchestration
-go test ./durable/...
 ```
-
-Every external durable backend must run `durable/contract.RunBackendContractTests`, including a process-reopen implementation.
 
 ## Commit and pull request conventions
 
-Use Conventional Commits with a focused scope, for example `feat(agent): ...`, `fix(durable): ...`, `test(orchestration): ...`, or `docs(migration): ...`. Explain why public behavior changes, list validation commands, link issues, and identify public API or backend-contract impact.
+Use Conventional Commits with a focused scope, for example `feat(agent): ...`, `fix(provider): ...`, `test(tool): ...`, or `docs(migration): ...`. Explain why public behavior changes, list validation commands, link issues, and identify public API impact.
 
 Never include AI-generated or AI co-author attribution in commit messages or pull request bodies.
 
 ## Gotchas
 
 - `agent.Result.Failure` is terminal Agent data; infrastructure failure remains outside the Agent result contract.
-- A durable result is terminal only when the runtime Go error is nil; infrastructure paths may return a partial result.
-- Only `provider.ErrNotStarted` and `tool.ErrNotExecuted` prove that an effect did not begin. All other ambiguous failures become unknown.
-- Streaming output is transient, not a durable exactly-once event log.
-- Durable execution covers one Agent loop. Persist `orchestration.State` separately when scheduling must survive restart.
-- The repository ships no production durable backend. `durable/internal/testbackend` is private test infrastructure; `examples/durable` is illustrative only.
+- Only `provider.ErrNotStarted` and `tool.ErrNotExecuted` prove that an effect did not begin.
+- Streaming output is transient, not an exactly-once event log.
+- Multi-agent orchestration and durable execution backends are application-owned concerns outside the core SDK.
 - Architecture gates are fail-closed. Missing required package scopes must fail rather than pass with an empty scan.

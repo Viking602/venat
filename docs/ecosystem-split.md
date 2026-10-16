@@ -9,9 +9,7 @@ The core module owns:
 - provider-neutral messages and model streaming
 - typed tools and validation
 - reusable instruction resources
-- one bounded Agent loop and its continuation format
-- policy-free dispatch mechanics
-- optional durable execution verbs and backend conformance tests
+- one bounded Agent loop, its continuation format, and effect interception seams
 
 These contracts are useful across products without assuming identity, organization, deployment, business state, or storage schema.
 
@@ -35,13 +33,10 @@ Protocol-specific or operational integrations should ship in separate modules wh
 
 An adapter should target one narrow current interface:
 
-- `provider.Driver`
-- `tool.Driver`
+- `provider.Driver` and `provider.StreamInterceptor`
+- `tool.Driver` and `tool.Interceptor`
 - `skill` resource loading
-- `orchestration.Executor`
-- `durable.Backend`
-
-Durable adapters must expose their conformance test invocation and document operational guarantees beyond the core semantic contract.
+- `agent.BoundaryObserver` and `agent.Hook`
 
 ## Acceptance rule
 

@@ -26,9 +26,9 @@ The Bus owns update identity and sequence, clones mutable fields, enforces 65,53
 
 `agent.HookChain` runs hooks in caller order. Hooks can observe or deterministically transform supported lifecycle values. Each hook receives an ownership-independent value; panic becomes a typed Agent failure.
 
-Do not assume hook side effects are covered by `durable.Runtime`. Persist them independently or make them idempotent.
+Do not assume hook side effects are automatically persisted. Persist them independently or make them idempotent.
 
-Application-owned approval can compose a `BeforeToolCall` hook, `durable.Runtime.Suspend`, a separately persisted decision keyed by execution and operation ID, and a tool driver wrapper. Resume with checkpoint/operation assertions; do not encode approval state in Agent continuation.
+Application-owned approval can compose a `BeforeToolCall` hook, a separately persisted decision keyed by execution and operation ID, and a tool driver wrapper. Resume from a saved `agent.Continuation`; do not encode approval state in Agent continuation.
 
 ## Step decisions and observation
 
@@ -44,7 +44,7 @@ Guardrails validate or transform output; authorization and business approval rem
 
 ## Continuation boundaries
 
-`agent.BoundaryObserver` synchronously receives complete continuations at safe phases. Observers are joined in order and stop on the first error. Durable execution appends its observer after caller observers.
+`agent.BoundaryObserver` synchronously receives complete continuations at safe phases. Observers are joined in order and stop on the first error.
 
 A boundary observer must not edit the continuation or persist a partial merge. Use a complete replacement record with a content hash.
 
@@ -63,13 +63,3 @@ Agent fits only the provider-facing view and retains the full transcript.
 Custom managers retain their existing `Compact`/`CompactTo` behavior; they must
 preserve pending user input, complete exchanges, and skill/cache context. Use a
 model-aware `CompactTo` for media. See [Agent execution](agent-execution.md).
-
-## Schedulers and executors
-
-`orchestration.Scheduler` is the extension point for application routing policy. It receives a cloned state and returns opaque dispatches. `orchestration.Executor` maps each route to concrete execution.
-
-Schedulers should be deterministic for a persisted state. Executors return Agent failures as `agent.Result` data and infrastructure failures as Go errors.
-
-## Durable backends
-
-`durable.Backend` is the only persistence extension in the core. Implementations must pass the published conformance suite. The runtime owns attempt codecs; backends persist payload bytes without interpreting provider or tool data.

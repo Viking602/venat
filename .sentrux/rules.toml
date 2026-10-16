@@ -1,6 +1,6 @@
 # Venat structural rules — enforced by `sentrux check .`.
 #
-# ADR-029 defines the exhaustive production capability graph:
+# ADR-031 defines the exhaustive production capability graph:
 #
 #   message      skill
 #      |           |
@@ -8,9 +8,6 @@
 #      +-- tool    |
 #           \      /
 #             agent
-#            /     \
-#   orchestration  durable
-#
 # Sentrux enforces graph-wide cycles and file coupling. The exact package
 # allowlist, including Production/TestImports/XTestImports and fail-closed
 # required scopes, is enforced by scripts/check-import-boundaries.sh.

@@ -32,8 +32,7 @@ jobs:
         run: |
           go run ./examples/agent
           go run ./examples/subagent
-          go run ./examples/orchestration
-          go run ./examples/durable
+          go run ./examples/interactive
 
       - name: Run race tests
         run: go test -race -timeout=10m ./...

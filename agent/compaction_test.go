@@ -301,6 +301,7 @@ func TestEngineRunPreparesContextAfterToolResult(t *testing.T) {
 		t.Fatalf("second CompactTo history omitted tool result: %#v", cm.histories[1])
 	}
 }
+
 func TestRunMessagesContextUsageBoundariesAndResume(t *testing.T) {
 	summaryUsage := provider.Usage{InputTokens: 4, OutputTokens: 1, TotalTokens: 5}
 	summariesRemaining := 2
@@ -464,4 +465,88 @@ func (builder accountedContextBuilder) Compact(ctx context.Context, history []me
 
 func (builder accountedContextBuilder) CompactTo(ctx context.Context, history []message.Message, target int) ([]message.Message, error) {
 	return builder.compact(ctx, history, target)
+}
+
+func TestEngineRunStructuredRepairKeepsContextUsageBoundariesValid(t *testing.T) {
+	summarized := false
+	compact := func(ctx context.Context, history []message.Message, _ int) ([]message.Message, error) {
+		if !summarized {
+			summarized = true
+			if observer := WorkingMemoryObserverFromContext(ctx); observer != nil {
+				observer(ctx, WorkingMemoryProgress{Phase: "complete", SummaryUsage: provider.Usage{InputTokens: 4, OutputTokens: 1, TotalTokens: 5}})
+			}
+		}
+		return history, nil
+	}
+	schema := json.RawMessage(`{"type":"object","properties":{"score":{"type":"integer","enum":[1,2]}},"required":["score"]}`)
+	_, engine := newOutputPolicyEngine(`{"score":3}`, `{"score":2}`)
+	engine.ContextBuilder = accountedContextBuilder{compact: compact}
+	engine.LoopPolicy = LoopPolicy{ContextTokenTarget: 1_000}
+	boundaries := 0
+	engine.Boundaries = BoundaryObserverFunc(func(_ context.Context, continuation Continuation) error {
+		boundaries++
+		return ValidateContinuation(continuation)
+	})
+
+	result := engine.Run(context.Background(), Request{Prompt: "score"}, OutputPolicy{Schema: schema, Validate: true, Repair: true, MaxRepairAttempts: 1})
+	if result.Failure != nil || result.RepairCount != 1 {
+		t.Fatalf("Run failure=%v repairs=%d, want repaired success", result.Failure, result.RepairCount)
+	}
+	last := result.Steps[len(result.Steps)-1]
+	if last.ContextUsage.TotalTokens != 5 || int64(result.Usage.TotalTokens) != last.BudgetUsed.Tokens {
+		t.Fatalf("last step context=%d budget=%d usage=%d, want context 5 and matching budget", last.ContextUsage.TotalTokens, last.BudgetUsed.Tokens, result.Usage.TotalTokens)
+	}
+	var validating *Continuation
+	_, resumeEngine := newOutputPolicyEngine(`{"score":3}`, `{"score":2}`)
+	resumeEngine.ContextBuilder = accountedContextBuilder{compact: compact}
+	resumeEngine.LoopPolicy = LoopPolicy{ContextTokenTarget: 1_000}
+	summarized = false
+	resumeEngine.Boundaries = BoundaryObserverFunc(func(_ context.Context, continuation Continuation) error {
+		if validating == nil && continuation.Phase == ContinuationValidatingOutput {
+			saved := continuation
+			validating = &saved
+			return errors.New("pause before repair")
+		}
+		return ValidateContinuation(continuation)
+	})
+	if paused := resumeEngine.Run(context.Background(), Request{Prompt: "score"}, OutputPolicy{Schema: schema, Validate: true, Repair: true, MaxRepairAttempts: 1}); paused.Failure == nil || validating == nil {
+		t.Fatalf("expected validating_output pause, got failure=%v continuation=%v", paused.Failure, validating)
+	}
+	resumed := resumeEngine.Resume(context.Background(), *validating)
+	if resumed.Failure != nil || resumed.RepairCount != 1 {
+		t.Fatalf("Resume failure=%v repairs=%d, want repaired success", resumed.Failure, resumed.RepairCount)
+	}
+	if boundaries == 0 {
+		t.Fatal("no boundary observed")
+	}
+}
+
+func TestRunMessagesFailedSummaryUsageIsReported(t *testing.T) {
+	calls := 0
+	compact := func(ctx context.Context, history []message.Message, _ int) ([]message.Message, error) {
+		calls++
+		if calls == 2 {
+			if observer := WorkingMemoryObserverFromContext(ctx); observer != nil {
+				observer(ctx, WorkingMemoryProgress{Phase: "failed", SummaryUsage: provider.Usage{InputTokens: 4, OutputTokens: 1, TotalTokens: 5}})
+			}
+			return nil, errors.New("summary failed")
+		}
+		return history, nil
+	}
+	driver := &scriptedProvider{turns: [][]provider.Event{{
+		{Kind: provider.EventToolCall, ToolCall: &message.ToolCall{ID: "call-1", Name: "lookup", Arguments: json.RawMessage(`{"query":"x"}`)}},
+		{Kind: provider.EventDone, StopReason: provider.StopReasonToolUse, Usage: usagePerTurn(10)},
+	}}}
+	output, err := newLoopToolEngine(t, driver).RunMessages(context.Background(), LoopInput{
+		Model:              "test-model",
+		Messages:           []message.Message{message.NewText(message.RoleUser, "use a tool")},
+		ContextTokenTarget: 100,
+		CompactTo:          compact,
+	})
+	if err == nil {
+		t.Fatal("RunMessages error = nil, want summary failure")
+	}
+	if output.Usage.TotalTokens != 15 || output.Steps[len(output.Steps)-1].BudgetUsed.Tokens != 15 {
+		t.Fatalf("usage=%d step budget=%d, want both 15 including failed summary", output.Usage.TotalTokens, output.Steps[len(output.Steps)-1].BudgetUsed.Tokens)
+	}
 }

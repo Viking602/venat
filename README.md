@@ -4,13 +4,13 @@
 [![CI](https://github.com/Viking602/venat/actions/workflows/ci.yml/badge.svg)](https://github.com/Viking602/venat/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/Viking602/venat?sort=semver)](https://github.com/Viking602/venat/releases)
 
-Venat is a typed Go SDK for agents that work across long tasks: model-backed working memory, retrievable tool output, concurrent tools, live worker collaboration, and executable completion checks. Crash-safe execution is optional. Applications retain ownership of identity, routing policy, storage schema, deployment, and operations.
+Venat is a typed Go SDK for agents that work across long tasks: model-backed working memory, retrievable tool output, concurrent tools, synchronous subagents, and executable completion checks. Applications retain ownership of identity, routing policy, multi-agent orchestration, storage schema, deployment, and operations.
 
 For command-error correction, working memory, tool-output retrieval, live input,
 and task verification, see [Agent execution](docs/agent-execution.md).
 The credential-free examples below exercise real execution paths with local providers.
 
-> **Status:** The latest published release is [v0.19.0](https://github.com/Viking602/venat/releases/tag/v0.19.0). Public APIs may change before v1.0. This version changes Durable hash helper signatures and stored digests; see the [backend migration](docs/security-hardening.md#backend-migration).
+> **Status:** The latest published release is [v0.19.0](https://github.com/Viking602/venat/releases/tag/v0.19.0). Public APIs may change before v1.0.
 
 ## Packages
 
@@ -21,9 +21,6 @@ The credential-free examples below exercise real execution paths with local prov
 | [`provider`](https://pkg.go.dev/github.com/Viking602/venat/provider) | Streaming model driver contract, interceptors, conformance helpers, and provider adapters |
 | [`tool`](https://pkg.go.dev/github.com/Viking602/venat/tool) | Typed drivers, ordered parallel groups, output artifacts with read/search, real-time updates, and interceptors |
 | [`skill`](https://pkg.go.dev/github.com/Viking602/venat/skill) | Reusable instruction resources and discovery |
-| [`orchestration`](https://pkg.go.dev/github.com/Viking602/venat/orchestration) | Asynchronous worker runtime and task tools, plus the existing scheduling protocol and batch drive |
-| [`durable`](https://pkg.go.dev/github.com/Viking602/venat/durable) | Optional execution persistence, leases, checkpoints, effect settlement, replay, and reconciliation |
-| [`durable/contract`](https://pkg.go.dev/github.com/Viking602/venat/durable/contract) | Conformance suite for application-supplied durable backends |
 
 There is no privileged root façade. Composition remains visible in application code.
 
@@ -119,86 +116,29 @@ parent := agent.Engine{
 }
 ```
 
-The default input is `{"task":"..."}`. `NewAgentTool` is synchronous. For workers
-that continue while the parent works, use `orchestration.NewRuntime`.
-Applications still own routing, workspace/process isolation, and deployment.
+The default input is `{"task":"..."}`. `NewAgentTool` is synchronous.
+Applications own routing, asynchronous task queues, workspace/process isolation, and deployment.
 
-## Application-defined orchestration
+## Continuation and recovery primitives
 
-`orchestration.Scheduler` is a pure function over an immutable state snapshot. It returns stable dispatch IDs and opaque routes. `orchestration.Drive` executes each tick with bounded concurrency and folds successful outcomes deterministically.
+`agent.Continuation` captures the complete provider-neutral state at safe loop boundaries (`ready`, `model_complete`, `tools_complete`, `validating_output`) with canonical v1/v2 JSON encoding (`agent.EncodeContinuation` / `agent.DecodeContinuation`) and strict validation (`agent.ValidateContinuation`).
 
-```go
-state, err := orchestration.Drive(ctx, scheduler, executor, orchestration.DriveOptions{
-    MaxTicks:       16,
-    MaxConcurrency: 4,
-})
-```
-
-Agent identity, teams, routing strategy, shared state, approvals, and deployment are application concerns. Persist `orchestration.State` in application storage when orchestration itself must survive a restart.
-
-### Live worker collaboration
-
-`orchestration.NewRuntime` owns an in-memory worker pool and independently
-addressable tasks. `Runtime.Tools()` exposes `spawn`, `inspect`, `await`, `send`,
-`steer`, and `cancel` to a parent model. Follow-up messages retain child context.
-
-Attach `Runtime.CompletionHook(parentControl)` alongside `Engine.Control` to
-deliver labeled worker evidence at model boundaries and retain it in the parent
-transcript. Results do not wait for the slowest worker in a batch.
-`RequiredTasksGuardrail` can prevent premature completion while required work is
-pending. `Runtime.Close` cancels and joins runtime-owned work; interrupting a
-parent turn does not implicitly close the worker runtime.
-
-See `examples/async-agents` for a parent Engine that starts workers, consumes the
-fast result while a slow worker is still active, sends a follow-up, and cancels
-independent work.
-
-
-## Optional durable execution
-
-`durable.Runtime` wraps the same `agent.Engine` loop. It persists immutable execution input, safe continuations, fenced leases, and provider/tool attempt outcomes through an injected `durable.Backend`.
-
-```go
-runtime, err := durable.New(applicationBackend, durable.Options{
-    OwnerID: "worker-7",
-})
-if err != nil {
-    return err
-}
-
-result, err := runtime.Start(
-    ctx,
-    durable.ExecutionID("job-42"),
-    engine,
-    agent.Request{Prompt: "Perform the task"},
-    agent.OutputPolicy{},
-)
-```
-
-A provider or tool effect whose outcome cannot be proven becomes `unknown`. The runtime returns a typed `durable.ReconcileRequiredError`; the application records its real-world finding and explicitly chooses `succeed`, `fail`, or `retry` with `Runtime.Reconcile`, then calls `Resume`.
-
-Applications own backend schema and operations. Venat ships no production backend. Every backend must run `durable/contract.RunBackendContractTests`.
-
-Use `ResumeWithOptions` when an application controller must assert the current checkpoint sequence, phase, or pending operation before any Engine or effect work. `examples/durable` also demonstrates application-owned human approval through `Hook`, `Suspend`, a separate approval store, a tool wrapper, and targeted resume; no approval policy is built into the SDK.
+Applications that persist executions attach an `agent.BoundaryObserver`, `provider.StreamInterceptor`, and `tool.Interceptor` to integrate with their own database transactions, leases, and artifact stores without adopting a second framework-owned state machine.
 
 ## Executable examples
 
 ```bash
 go run ./examples/agent
 go run ./examples/subagent
-go run ./examples/orchestration
-go run ./examples/durable
+go run ./examples/interactive
 go run ./examples/tool-output
 go run ./examples/working-memory
 go run ./examples/parallel-tools
-go run ./examples/async-agents
 go run ./examples/task-verification
 go run ./examples/streaming-tools
 go run ./examples/pause-continuation
 go run ./examples/live-steering
 ```
-
-The durable example keeps its illustrative backend inside the example directory; it is not a reusable storage adapter.
 
 ## Architecture
 
@@ -211,21 +151,18 @@ message      skill
    └── tool    │
         \      /
           agent
-         /     \
-orchestration  durable
 ```
 
-`agent` and `orchestration` never depend on `durable`. The optional durability layer depends inward on Agent contracts. Executable architecture gates validate production, internal-test, and external-test imports and fail when a required package scope disappears.
+Executable architecture gates validate production, internal-test, and external-test imports and fail when a required package scope disappears.
 
 See:
 
 - [Quickstart](docs/quickstart.md)
 - [Public API](docs/public-api.md)
-- [Durable execution](docs/durable-execution.md)
 - [Backend and extension development](docs/plugin-development.md)
 - [Architecture boundaries](docs/architecture-boundaries.md)
 - [Breaking migration](docs/migration.md)
-- [ADR-029](docs/adr/ADR-029-agent-sdk-and-optional-durable-runtime.md)
+- [ADR-031](docs/adr/ADR-031-core-agent-sdk-consolidation.md)
 - [ADR-030](docs/adr/ADR-030-stream-lifecycle-semantics.md)
 
 ## Development

@@ -116,8 +116,8 @@ Primary entry points:
 - low-level `Engine.RunMessages`
 
 `Request.Validate` and `ValidateOutputPolicy` preflight inputs without performing
-effects; orchestration and durable admission use the same checks. Typed user
-content supports text, images, audio, and files, subject to provider support.
+effects. Typed user content supports text, images, audio, and files, subject to
+provider support.
 
 `SessionBudget` is persisted with a continuation and bounds cumulative session
 tokens and active wall-clock time. `Budget` remains the per-Engine execution
@@ -140,7 +140,6 @@ Live interaction has three distinct modes: `Control.Send` appends information at
 the next safe boundary; `Control.Steer` interrupts model sampling where safe and
 continues with a direction correction; `Control.FollowUp` waits for natural
 completion of current work. All return admission errors plus consumption receipts.
-`Runtime.Steer` and `TaskHandle.Steer` provide the corresponding worker operation.
 Started tool effects are not rolled back or automatically replayed.
 
 `provider.StopReasonPause` is an explicit nonterminal response, including
@@ -211,58 +210,8 @@ includes both; ready-boundary resume restores the auxiliary counters without
 counting a summary twice. Zero auxiliary fields remain omitted from canonical
 encoding, preserving existing fixture bytes.
 
-
-## `orchestration`
-
-`Scheduler.Next(context.Context, State)` is a policy-free scheduling boundary. It returns stable `Dispatch` values with an opaque route, Agent request, output policy, optional handoff payload, and metadata.
-
-`Executor.Execute` performs one dispatch. `Drive` provides only mechanical behavior:
-
-- validation and globally unique dispatch IDs
-- bounded ticks, concurrency, Drive wall-clock, and per-dispatch deadlines
-- context cancellation and panic containment
-- deterministic success folding and multi-error ordering
-- source-labeled serialized output frames
-
-Agent failures remain `Result` data. The `error` return is reserved for infrastructure failure.
-
-`NewRuntime` adds in-memory live collaboration without changing Drive's tick
-contract. A Runtime owns task goroutines and supports Spawn, Inspect, Await,
-SendFollowup, Cancel, and Close. Its model-callable Tools expose the same actions.
-`CompletionHook(parentControl)` labels worker evidence and queues it into parent
-history at safe boundaries and tracks consumption receipts. Each
-`DrainCompletions` consumer owns a cursor into a bounded retained journal;
-`ErrCompletionCursorStale` reports lag explicitly. Latest task results remain
-available through Inspect/Await. `Completions` is advisory, and independent
-waiters use broadcast state changes rather than competing for its messages.
-`RequiredTasksGuardrail` waits for required work before accepting a final answer.
-
-
-## `durable`
-
-`durable.Backend` is an execution-semantic persistence interface with exactly these operations:
-
-- start, resume, renew, checkpoint, suspend, finish, release, and load execution
-- start, finish, mark unknown, and reconcile an effect attempt
-
-`durable.Runtime` uses that interface through:
-
-- `Start` / `StartStream`
-- `Resume` / `ResumeStream` and target-asserting `ResumeWithOptions` / `ResumeStreamWithOptions`
-- `Suspend`
-- `Reconcile`
-- `Close`
-
-Runtime errors preserve typed execution or attempt attribution and support `errors.Is` against the durable sentinels. Any Agent result available when infrastructure fails is returned as partial data. Callers may treat the result as a terminal execution outcome only when the Go error is nil.
-
-`ResumeTarget` can assert the checkpoint sequence, continuation phase, and pending operation slot after checkpoint/reconciliation validation but before Engine, hook, sink, provider, or tool work. A mismatch returns `ErrResumeTargetMismatch` with `ResumeTargetError` facts and best-effort releases the lease; it never changes the continuation.
-
-Durable provider attempts retain complete terminal event sequences. Tool attempts retain only the normalized final result or failure: transient tool updates are never stored in attempts or checkpoints, and reopen replay emits no historical updates. Tool settlement completes before the final tool-result frame can be delivered.
-
-See [Durable execution](durable-execution.md) for fencing and ambiguity rules.
-
 ## Public-shape rules
 
 Exported functions in all public package families must not return `[]any`. Exported fields must not contain loose `any` unless the immediately preceding line carries `// godoc-allow-any`. A genuinely open function result requires `//venat:allow-public-any` immediately above its declaration.
 
-The AST-based architecture gate scans `message`, `provider`, `tool`, `skill`, `agent`, `orchestration`, and `durable`; missing or empty scopes fail the gate.
+The AST-based architecture gate scans `message`, `provider`, `tool`, `skill`, and `agent`; missing or empty scopes fail the gate.

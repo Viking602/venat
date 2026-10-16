@@ -99,6 +99,18 @@ func cloneEvents(src []provider.Event) []provider.Event {
 			}
 			current.ToolCall = &toolCall
 		}
+		if event.ToolCallDelta != nil {
+			delta := *event.ToolCallDelta
+			if event.ToolCallDelta.Index != nil {
+				index := *event.ToolCallDelta.Index
+				delta.Index = &index
+			}
+			current.ToolCallDelta = &delta
+		}
+		if event.ProviderState != nil {
+			current.ProviderState = append(json.RawMessage(nil), event.ProviderState...)
+		}
+		current.Response = message.CloneResponseMetadata(event.Response)
 		cloned = append(cloned, current)
 	}
 	return cloned

@@ -7,7 +7,7 @@ cd "$ROOT"
 
 removed_dirs=(
   api worker policy session transport packs coding eval cmd contract internal
-  multiagent hook stream _examples workflow blackboard
+  multiagent hook stream _examples workflow blackboard orchestration durable
 )
 violations=0
 
@@ -24,16 +24,19 @@ if find . -maxdepth 1 -type f -name '*.go' -print -quit | grep -q .; then
 fi
 
 module="$(go list -m -f '{{.Path}}')"
+# Capture first: a process substitution would discard go list's exit status
+# and let an unloadable package tree pass with a partial scan.
+packages="$(go list -f '{{.ImportPath}}' ./...)"
 while IFS= read -r package; do
   case "$package" in
-    "$module"/message|"$module"/message/*|"$module"/provider|"$module"/provider/*|"$module"/tool|"$module"/tool/*|"$module"/skill|"$module"/skill/*|"$module"/agent|"$module"/agent/*|"$module"/orchestration|"$module"/orchestration/*|"$module"/durable|"$module"/durable/*|"$module"/examples/*|"$module"/scripts/publicany)
+    "$module"/message|"$module"/message/*|"$module"/provider|"$module"/provider/*|"$module"/tool|"$module"/tool/*|"$module"/skill|"$module"/skill/*|"$module"/agent|"$module"/agent/*|"$module"/examples/*|"$module"/scripts/publicany)
       ;;
     *)
       echo "FAIL [package-graph]: unexpected production package $package" >&2
       violations=$((violations + 1))
       ;;
   esac
-done < <(go list -f '{{.ImportPath}}' ./...)
+done <<<"$packages"
 
 if ! python3 <<'PY'
 import pathlib
@@ -43,7 +46,7 @@ import sys
 root = pathlib.Path(".")
 skip_dirs = {".git"}
 legacy_import = re.compile(
-    r'"github\.com/Viking602/venat(?:"|/(?:api|worker|policy|session|transport|packs|coding|eval|contract|multiagent|hook|stream|internal)(?:/[^"\s]*)?")'
+    r'"github\.com/Viking602/venat(?:"|/(?:api|worker|policy|session|transport|packs|coding|eval|contract|multiagent|hook|stream|internal|orchestration|durable)(?:/[^"\s]*)?")'
 )
 legacy_symbol = re.compile(
     r"\b(?:StoreProvider|UnitOfWork|Runner|TurnControl|ContextTransition|AsTool)\b|"
@@ -58,6 +61,7 @@ def production_go_files():
         yield path
 
 current_docs = [
+    pathlib.Path("AGENTS.md"),
     pathlib.Path("README.md"),
     pathlib.Path("CONTRIBUTING.md"),
     pathlib.Path("RELEASING.md"),

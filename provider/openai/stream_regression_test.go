@@ -64,6 +64,35 @@ func TestDriverStreamPreservesToolCallIndexAndNormalizesOpenAIStyleDeltas(t *tes
 	}
 }
 
+func TestDriverStreamNormalizesIndexlessToolCallDeltas(t *testing.T) {
+	stream := newChatCompletionTestStream(t,
+		"data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"id\":\"call-1\",\"function\":{\"name\":\"lookup\",\"arguments\":\"{\\\"query\\\":\"}}]}}]}\n\n"+
+			"data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"\\\"venat\\\"}\"}}]}}]}\n\n"+
+			"data: {\"choices\":[{\"finish_reason\":\"tool_calls\"}]}\n\n"+
+			"data: [DONE]\n\n",
+	)
+	normalized, err := provider.NormalizeEvents(collectEvents(t, stream))
+	if err != nil {
+		t.Fatalf("NormalizeEvents() error = %v", err)
+	}
+	if len(normalized.ToolCalls) != 1 || normalized.ToolCalls[0].ID != "call-1" || string(normalized.ToolCalls[0].Arguments) != `{"query":"venat"}` {
+		t.Fatalf("tool calls = %#v, want one merged call-1", normalized.ToolCalls)
+	}
+
+	multi := newChatCompletionTestStream(t,
+		"data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"id\":\"call-1\",\"function\":{\"name\":\"lookup\",\"arguments\":\"{\\\"a\\\":1}\"}},{\"id\":\"call-2\",\"function\":{\"name\":\"fetch\",\"arguments\":\"{\\\"b\\\":2}\"}}]}}]}\n\n"+
+			"data: {\"choices\":[{\"finish_reason\":\"tool_calls\"}]}\n\n"+
+			"data: [DONE]\n\n",
+	)
+	normalizedMulti, err := provider.NormalizeEvents(collectEvents(t, multi))
+	if err != nil {
+		t.Fatalf("NormalizeEvents(multi) error = %v", err)
+	}
+	if len(normalizedMulti.ToolCalls) != 2 || normalizedMulti.ToolCalls[0].ID != "call-1" || normalizedMulti.ToolCalls[1].ID != "call-2" {
+		t.Fatalf("multi tool calls = %#v, want call-1 and call-2", normalizedMulti.ToolCalls)
+	}
+}
+
 func TestDriverStreamRejectsNon2xxStatus(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		writer.Header().Set("Content-Type", "application/json")

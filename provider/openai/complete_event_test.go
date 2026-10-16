@@ -34,10 +34,56 @@ func TestChatStream_EmitsCompleteToolCallOnlyAfterArgumentsFinish(t *testing.T) 
 	}
 }
 
-func TestResponsesStream_EmitsCompleteToolCallAtOutputItemDone(t *testing.T) {
-	stream := responsesStream{items: map[int]*responsesOutputState{0: {callID: "call-1", name: "lookup"}}, completeToolCalls: true}
-	event := stream.outputItemDone(0, responsesOutputItem{Type: "function_call", Arguments: `{"q":"ok"}`})
-	if event.Kind != provider.EventToolCall || event.ToolCall == nil || event.ToolCall.ID != "call-1" {
-		t.Fatalf("event=%#v", event)
+func TestResponsesStream_DeliversCompleteToolCallWithoutArgumentDeltas(t *testing.T) {
+	for _, complete := range []bool{false, true} {
+		stream := newResponsesTestStream(`data: {"type":"response.output_item.added","output_index":0,"item":{"id":"fc_1","type":"function_call","call_id":"call_1","name":"lookup","arguments":""}}
+
+data: {"type":"response.output_item.done","output_index":0,"item":{"id":"fc_1","type":"function_call","call_id":"call_1","name":"lookup","arguments":"{\"q\":\"x\"}"}}
+
+data: {"type":"response.completed","response":{"output":[{"id":"fc_1","type":"function_call","call_id":"call_1","name":"lookup","arguments":"{\"q\":\"x\"}"}],"usage":{}}}
+
+`)
+		stream.completeToolCalls = complete
+		normalized, err := provider.NormalizeEvents(collectEvents(t, stream))
+		if err != nil {
+			t.Fatalf("complete=%v NormalizeEvents error = %v", complete, err)
+		}
+		if len(normalized.ToolCalls) != 1 || normalized.ToolCalls[0].ID != "call_1" || string(normalized.ToolCalls[0].Arguments) != `{"q":"x"}` {
+			t.Fatalf("complete=%v tool calls = %#v, want call_1 with arguments", complete, normalized.ToolCalls)
+		}
+	}
+}
+
+func TestResponsesStream_BindsDelayedCallMetadataAtOutputItemDone(t *testing.T) {
+	for _, delta := range []string{`"{\"q\":\"x\"}"`, `""`} {
+		for _, complete := range []bool{false, true} {
+			stream := newResponsesTestStream(`data: {"type":"response.function_call_arguments.delta","output_index":0,"delta":` + delta + `}
+
+data: {"type":"response.output_item.done","output_index":0,"item":{"id":"fc_1","type":"function_call","call_id":"call_1","name":"lookup","arguments":"{\"q\":\"x\"}"}}
+
+data: {"type":"response.completed","response":{"output":[{"id":"fc_1","type":"function_call","call_id":"call_1","name":"lookup","arguments":"{\"q\":\"x\"}"}],"usage":{}}}
+
+`)
+			stream.completeToolCalls = complete
+			events := collectEvents(t, stream)
+			normalized, err := provider.NormalizeEvents(events)
+			if err != nil {
+				t.Fatalf("delta=%s complete=%v NormalizeEvents error = %v", delta, complete, err)
+			}
+			if len(normalized.ToolCalls) != 1 || normalized.ToolCalls[0].ID != "call_1" || normalized.ToolCalls[0].Name != "lookup" || string(normalized.ToolCalls[0].Arguments) != `{"q":"x"}` {
+				t.Fatalf("delta=%s complete=%v tool calls = %#v, want call_1 lookup with arguments", delta, complete, normalized.ToolCalls)
+			}
+			if complete {
+				sawComplete := false
+				for _, ev := range events {
+					if ev.Kind == provider.EventToolCall && ev.ToolCall != nil && ev.ToolCall.ID == "call_1" {
+						sawComplete = true
+					}
+				}
+				if !sawComplete {
+					t.Fatalf("delta=%s complete=true did not emit EventToolCall: %#v", delta, events)
+				}
+			}
+		}
 	}
 }

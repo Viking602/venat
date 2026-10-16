@@ -5,7 +5,7 @@ authorization, routing, process/sandbox resources, and persistent backends.
 
 ## Codex-style execution envelopes
 
-The SDK keeps four limits separate:
+The SDK keeps three limits separate:
 
 - `Request.Budget` bounds one `Engine` execution with token, step, tool-call,
   and wall-clock dimensions.
@@ -18,14 +18,9 @@ The SDK keeps four limits separate:
   `RequestTimeout` caps the whole model request; otherwise the execution or
   caller context remains the outer deadline. A timed-out stream is closed and
   returns a typed provider error.
-- `orchestration.DriveOptions` keeps the existing default of four concurrent
-  dispatches and 64 ticks, and now accepts `MaxWallClock` for the whole drive
-  and `DispatchTimeout` for each executor call. Zero leaves the caller context
-  as the outer bound.
 
 These controls do not retry a partially delivered model stream or infer that a
-timed-out external effect did not happen. They only stop the owning boundary;
-the existing durable unknown-effect and reconciliation rules still apply.
+timed-out external effect did not happen. They only stop the owning boundary.
 
 ## Local executable proof
 
@@ -355,14 +350,11 @@ instructions, user constraints, unresolved errors and complete tool exchanges.
 The deterministic default fitter above remains responsible for the context limit.
 This keeps scoring available without introducing an SDK retention policy.
 
-Scores and provenance are ordinary structured tool results, persisted and replayed
-by durable's existing tool effect protocol. A settled selection is reused after
-checkpoint failure/reopen, even with the endpoint offline. Ambiguous remote calls
-remain unknown and require the existing reconciliation flow. Auxiliary Jev tokens
+Scores and provenance are ordinary structured tool results. Auxiliary Jev tokens
 are reported separately in the result; `Result.Usage`/`Budget.MaxTokens` still
 measure the main model. Each evaluation consumes the normal tool-call budget.
 
-Local HTTP capture, invalid responses, protected entries and durable reopen are
+Local HTTP capture, invalid responses, and protected entries are
 tested. Compression quality, actual token savings, latency and live provider
 compatibility require caller credentials and a representative evaluation set;
 no authenticated Jev quality result is claimed here.
@@ -430,8 +422,8 @@ case <-ctx.Done():
 
 Admission and consumption are different. Each buffered receipt yields exactly
 one result, then closes. A successful receipt does not mean the model has already
-answered the input. With `durable.Runtime`, it means the checkpoint observer also
-succeeded; without a persistent observer it means in-memory consumption only.
+answered the input. It means the boundary observer succeeded; without a persistent
+observer it means in-memory consumption only.
 Do not synchronously wait on the receipt inside a hook or output sink: the loop
 must return from that callback before it can consume the input.
 
@@ -444,43 +436,21 @@ reject unconsumed receipts. Terminal admission and input submission are synchron
 the terminal decision are rejected even if output validation is still finishing.
 
 `control.Cancel()` cancels the active model/tool context. Handles are single-use.
-Use Send for authorized input. For worker results,
-`Runtime.CompletionHook(parentControl)` handles provenance labeling and
-safe-boundary retention; never present raw worker output as trusted instructions.
+Use Send for authorized user input.
 
 Queued input is process-local. Acknowledged input lives in checkpoint Messages.
 A crash before acknowledgement, or a checkpoint response loss, may leave the
 caller uncertain; inspect the checkpoint rather than blindly replaying input.
 Reopen with a fresh control. No exactly-once input delivery is claimed.
 
-## Live multi-agent collaboration
+## Continuation wire version and rollout
 
-`orchestration.Drive` retains batch/tick behavior. Use
-`orchestration.NewRuntime` for independently progressing workers:
+`agent.ContinuationSchemaVersion` is currently `2`. Version 2 adds typed request
+content, native-output opt-in, and auxiliary context usage. The strict decoder
+accepts versions 1 and 2, rejects unknown/missing/duplicate fields and future
+versions, and rejects v2 fields even when smuggled into a v1 document.
 
-- `Runtime.Tools()` exposes `spawn`, `inspect`, `await`, `send`, `steer`, and `cancel`.
-- Spawn returns a handle immediately; the runtime owns a worker pool and queue.
-- Send adds input at a safe boundary or continues idle-worker history.
-- `Runtime.Steer` / `TaskHandle.Steer` redirect a running worker's sampling while
-  preserving its identity and history; idle workers receive a new follow-up turn.
-  Running workers acknowledge consumption; idle workers acknowledge admission.
-- `CompletionHook(parentControl)` exposes evidence at the parent's model boundary
-  and queues it into the transcript. Without a control it is provider-view only.
-- `DrainCompletions(cursor)` reads a bounded retained journal; consumers own their
-  cursors. `ErrCompletionCursorStale` explicitly reports a cursor that fell behind
-  retention, rather than returning an incomplete success. Latest task results
-  remain available through Inspect/Await. The `Completions` channel is advisory.
-- `RequiredTasksGuardrail(runtime)` tracks dynamically spawned tasks; explicit
-  IDs restrict the set. It waits instead of burning retries, and reports failed
-  or canceled required work as an output block.
-- Close cancels and joins owned work. Its lifetime is separate from a parent's
-  current turn.
-
-The runtime is in-memory, not a persistent scheduler or workspace sandbox.
-`examples/async-agents` runs an actual parent Engine with task tools, fast-result
-consumption before a slow worker completes, retained follow-up context,
-independent cancellation, and shutdown checks.
-
-CubeSandbox/MCP adapters, interactive process sessions, and a production durable
-backend remain external. Summaries and tool-output retrieval are implemented
-above.
+Version 1 documents retain their original version and canonical bytes on decode
+and re-encode. The immutable `agent/testdata/continuation-v1.json` fixture covers
+this guarantee. `Engine.Resume` performs a pure in-memory upgrade to v2 so the
+next boundary emits v2 canonical bytes.

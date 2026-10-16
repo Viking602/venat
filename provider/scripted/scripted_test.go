@@ -62,3 +62,38 @@ func TestLoadScriptRejectsUnsupportedKind(t *testing.T) {
 		t.Fatal("expected error")
 	}
 }
+
+func TestScriptedProviderReplaysIsolatedMutableEventFields(t *testing.T) {
+	index := 0
+	source := []provider.Event{
+		{Kind: provider.EventToolCallDelta, ToolCallDelta: &provider.ToolCallDelta{Index: &index, ID: "call-1", ArgumentsDelta: "{}"}},
+		{Kind: provider.EventDone, ProviderState: json.RawMessage(`{"state":1}`), Response: provider.ResponseMetadata{Headers: map[string]string{"x-id": "1"}}},
+	}
+	driver := New(source)
+	source[0].ToolCallDelta.ID = "mutated"
+	index = 9
+	source[1].ProviderState[10] = '9'
+	source[1].Response.Headers["x-id"] = "mutated"
+
+	stream, err := driver.Stream(context.Background(), provider.Request{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, _ := stream.Recv()
+	first.ToolCallDelta.ID = "consumer-mutated"
+	done, _ := stream.Recv()
+	done.Response.Headers["x-id"] = "consumer-mutated"
+	if first.ToolCallDelta == nil || *first.ToolCallDelta.Index != 0 || string(done.ProviderState) != `{"state":1}` {
+		t.Fatalf("replay aliased caller events: delta=%#v state=%s", first.ToolCallDelta, done.ProviderState)
+	}
+
+	again, err := driver.Stream(context.Background(), provider.Request{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, _ := again.Recv()
+	secondDone, _ := again.Recv()
+	if second.ToolCallDelta.ID != "call-1" || secondDone.Response.Headers["x-id"] != "1" {
+		t.Fatalf("replay aliased across streams: delta=%#v headers=%v", second.ToolCallDelta, secondDone.Response.Headers)
+	}
+}

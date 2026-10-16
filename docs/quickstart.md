@@ -103,16 +103,6 @@ result := engine.RunStream(ctx, request, policy, agent.SinkFunc(
 
 A sink may receive text, thinking, tool calls, tool updates, tool results, completion, or error frames. Tool updates are ordered per operation ID and ignored by Agent history and accumulators. Delivery is transient. Persist a terminal `agent.Result` or an independently idempotent application projection rather than treating frames as exactly-once records. See [ADR-030](adr/ADR-030-stream-lifecycle-semantics.md).
 
-## 6. Add orchestration only when needed
+## 6. Observe continuations and intercept effects when needed
 
-Implement `orchestration.Scheduler` to turn an immutable `orchestration.State` into dispatches. Implement `orchestration.Executor` to map each opaque route to an Agent engine or another application action. `orchestration.Drive` bounds ticks and concurrency and folds outcomes in stable dispatch-ID order.
-
-See [`examples/orchestration`](../examples/orchestration).
-
-## 7. Add durability only when needed
-
-Inject an application-owned `durable.Backend` into `durable.New`. Call `Start` for a stable execution ID and `Resume` after a restart. Unknown effect outcomes require an explicit application reconciliation decision before work continues.
-
-For controller-driven approval or another externally coordinated resume, load the current checkpoint and use `ResumeWithOptions` to assert its sequence, phase, and pending operation before effects can start. The durable example shows the full application-owned approval flow.
-
-See [Durable execution](durable-execution.md) and [`examples/durable`](../examples/durable).
+Attach an `agent.BoundaryObserver` to persist canonical `agent.Continuation` snapshots at safe boundaries (`ready`, `model_complete`, `tools_complete`, `validating_output`), and use `Engine.Resume` / `Engine.ResumeStream` to continue from a validated snapshot. Wrap provider or tool execution with `provider.StreamInterceptor` and `tool.Interceptor` when integrating with application-owned persistence, leases, or audit logs.

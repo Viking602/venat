@@ -78,13 +78,16 @@ tidy: ## Run go mod tidy
 
 .PHONY: tidy-check
 tidy-check: ## Fail if go.mod / go.sum would change after `go mod tidy`
-	@cp go.mod go.mod.bak; cp go.sum go.sum.bak 2>/dev/null || true
-	$(GO) mod tidy
-	@if ! diff -q go.mod go.mod.bak >/dev/null 2>&1 || ! diff -q go.sum go.sum.bak >/dev/null 2>&1; then \
-		mv go.mod.bak go.mod; mv go.sum.bak go.sum 2>/dev/null || true; \
-		echo "go.mod / go.sum need 'go mod tidy'"; exit 1; \
-	fi
-	@rm -f go.mod.bak go.sum.bak
+	@cp go.mod go.mod.bak; cp go.sum go.sum.bak 2>/dev/null || true; \
+	status=0; \
+	if ! $(GO) mod tidy; then \
+		echo "go mod tidy failed"; status=1; \
+	elif ! diff -q go.mod go.mod.bak >/dev/null 2>&1 || ! diff -q go.sum go.sum.bak >/dev/null 2>&1; then \
+		echo "go.mod / go.sum need 'go mod tidy'"; status=1; \
+	fi; \
+	if [ $$status -ne 0 ]; then mv go.mod.bak go.mod; mv go.sum.bak go.sum 2>/dev/null || true; fi; \
+	rm -f go.mod.bak go.sum.bak; \
+	exit $$status
 
 .PHONY: test
 test: ## Run unit tests
