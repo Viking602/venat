@@ -105,6 +105,7 @@ type responsesOutputState struct {
 	callID            string
 	name              string
 	hadArgumentDeltas bool
+	arguments         strings.Builder
 }
 
 type responsesStream struct {
@@ -112,6 +113,7 @@ type responsesStream struct {
 	body                 io.ReadCloser
 	reader               *shared.Reader
 	items                map[int]*responsesOutputState
+	pending              []provider.Event
 	contextUsage         provider.ContextUsageObserver
 	contextUsageReported bool
 	finished             bool
@@ -553,6 +555,11 @@ func responsesTextFromRequest(format *provider.ResponseFormat) *responsesText {
 }
 
 func (s *responsesStream) Recv() (provider.Event, error) {
+	if len(s.pending) > 0 {
+		event := s.pending[0]
+		s.pending = s.pending[1:]
+		return event, nil
+	}
 	if s.finished {
 		return provider.Event{}, io.EOF
 	}
@@ -607,6 +614,15 @@ func (s *responsesStream) validateEvent(event responsesStreamEvent) error {
 		if _, exists := s.items[event.OutputIndex]; !exists && len(s.items) >= shared.MaxStreamItems {
 			return fmt.Errorf("openai responses output exceeds item limit")
 		}
+		if event.Type == "response.function_call_arguments.delta" {
+			current := 0
+			if existing := s.items[event.OutputIndex]; existing != nil {
+				current = existing.arguments.Len()
+			}
+			if len(event.Delta) > (1<<20)-current {
+				return fmt.Errorf("openai responses tool arguments exceed byte limit")
+			}
+		}
 	}
 	return nil
 }
@@ -631,6 +647,7 @@ func (s *responsesStream) consume(event responsesStreamEvent) (provider.Event, b
 	case "response.function_call_arguments.delta":
 		state := s.outputState(event.OutputIndex)
 		state.hadArgumentDeltas = true
+		state.arguments.WriteString(event.Delta)
 		index := event.OutputIndex
 		return provider.Event{
 			Kind: provider.EventToolCallDelta,
@@ -646,7 +663,7 @@ func (s *responsesStream) consume(event responsesStreamEvent) (provider.Event, b
 		// file_search_call) are executed by the provider inside the response;
 		// they stay in ProviderState and never become local tool calls.
 		result := s.outputItemDone(event.OutputIndex, event.Item)
-		return result, result.Kind == provider.EventToolCallDelta, nil
+		return result, result.Kind == provider.EventToolCall || result.Kind == provider.EventToolCallDelta, nil
 	case "response.completed":
 		return s.completed(event.Response)
 	case "response.incomplete":
@@ -668,26 +685,54 @@ func (s *responsesStream) consume(event responsesStreamEvent) (provider.Event, b
 func (s *responsesStream) outputItemDone(index int, item responsesOutputItem) provider.Event {
 	state := s.outputState(index)
 	hadArgumentDeltas := state.hadArgumentDeltas
+	accumulated := state.arguments.String()
+	hadCallID := state.callID
+	hadName := state.name
 	s.recordOutputItem(index, item)
 	if item.Type != "function_call" {
 		return provider.Event{}
 	}
 	indexCopy := index
 	if s.completeToolCalls && state.callID != "" && state.name != "" && json.Valid([]byte(item.Arguments)) {
-		return provider.Event{
+		completeEvent := provider.Event{
 			Kind: provider.EventToolCall,
 			ToolCall: &message.ToolCall{
 				ID: state.callID, Name: state.name, Arguments: json.RawMessage(item.Arguments),
 			},
 		}
+		if hadArgumentDeltas && (hadCallID == "" || hadName == "") {
+			s.pending = append(s.pending, completeEvent)
+			return provider.Event{
+				Kind: provider.EventToolCallDelta,
+				ToolCallDelta: &provider.ToolCallDelta{
+					Index: &indexCopy, ID: state.callID, Name: state.name,
+				},
+			}
+		}
+		return completeEvent
+	}
+	argsDelta := ""
+	switch {
+	case accumulated == "":
+		argsDelta = item.Arguments
+	case strings.HasPrefix(item.Arguments, accumulated):
+		argsDelta = item.Arguments[len(accumulated):]
 	}
 	if hadArgumentDeltas {
+		if (hadCallID == "" && state.callID != "") || (hadName == "" && state.name != "") || argsDelta != "" {
+			return provider.Event{
+				Kind: provider.EventToolCallDelta,
+				ToolCallDelta: &provider.ToolCallDelta{
+					Index: &indexCopy, ID: state.callID, Name: state.name, ArgumentsDelta: argsDelta,
+				},
+			}
+		}
 		return provider.Event{}
 	}
 	return provider.Event{
 		Kind: provider.EventToolCallDelta,
 		ToolCallDelta: &provider.ToolCallDelta{
-			Index: &indexCopy, ID: state.callID, Name: state.name, ArgumentsDelta: item.Arguments,
+			Index: &indexCopy, ID: state.callID, Name: state.name, ArgumentsDelta: argsDelta,
 		},
 	}
 }

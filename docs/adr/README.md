@@ -4,8 +4,9 @@ ADRs are immutable decision history. A later ADR may supersede their live guidan
 
 ## Current architecture
 
-- [ADR-029 — Agent SDK and optional durable runtime](ADR-029-agent-sdk-and-optional-durable-runtime.md) defines the current exhaustive package graph and supersedes earlier platform-oriented placement and API guidance.
-- [ADR-030 — Stream lifecycle semantics](ADR-030-stream-lifecycle-semantics.md) keeps provider pull streams and tool push updates domain-specific while fixing their shared ordering, backpressure, bounds, terminal, retry, and durable replay rules.
+- [ADR-031 — Core Agent SDK consolidation](ADR-031-core-agent-sdk-consolidation.md) consolidates the production capability graph to `message`, `provider`, `tool`, `skill`, and `agent`, superseding ADR-029's inclusion of `orchestration` and `durable`.
+- [ADR-029 — Agent SDK and optional durable runtime](ADR-029-agent-sdk-and-optional-durable-runtime.md) defines the direct-import Agent SDK cutover from the earlier platform surface.
+- [ADR-030 — Stream lifecycle semantics](ADR-030-stream-lifecycle-semantics.md) keeps provider pull streams and tool push updates domain-specific while fixing their shared ordering, backpressure, bounds, terminal, and retry rules.
 - [ADR-019 — Project identity: Venat](ADR-019-project-identity-venat.md) records the module identity.
 - [ADR-009 — Capability public API](ADR-009-capability-public-api.md) remains the origin of the public `any` discipline where ADR-029 retains it.
 

@@ -10,6 +10,7 @@ import (
 	"strings"
 	"sync"
 	"unicode"
+	"unicode/utf8"
 
 	"github.com/Viking602/venat/message"
 )
@@ -593,7 +594,11 @@ func levenshtein(left, right string) int {
 func rejectedCall(call Call, err error) Result {
 	label := call.Name
 	if len(label) > message.MaxToolNameBytes {
-		label = label[:message.MaxToolNameBytes] + "..."
+		end := message.MaxToolNameBytes
+		for end > 0 && !utf8.RuneStart(label[end]) {
+			end--
+		}
+		label = label[:end] + "..."
 	}
 	result := Result{
 		ToolCallID: call.ID, Name: call.Name,
@@ -659,6 +664,7 @@ func (b *Bus) ExecuteBatch(ctx context.Context, calls []Call, mode Mode, options
 	}
 	return results, nil
 }
+
 func skippedCallError(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
 		return errors.Join(ErrNotExecuted, err)

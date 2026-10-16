@@ -1,18 +1,15 @@
 # Migration to the direct Agent SDK
 
-ADR-029 is a breaking clean cutover. The former platform façade and platform-owned storage, worker, collaboration, policy, session, transport, bundle, sandbox, evaluation, and command packages were removed. No compatibility aliases or deprecated shims remain.
+ADR-031 and ADR-029 define the direct Agent SDK boundary. The former platform façade, storage providers, worker runtime, and the top-level `orchestration` and `durable` packages were removed. No compatibility aliases or deprecated shims remain.
 
 This document may name deleted APIs for migration purposes. Current API guidance lives in [Public API](public-api.md).
 
 ## Security boundary changes
 
-The 2026-10-04 scan fixes change durable hash helper signatures and stored digest
-semantics. External backends must migrate current records and response receipts,
-and rerun the backend contract suite before deployment. HTTPTool now confines
-redirects even with a custom client; `kit.Tool` rejects recursive input types;
-provider, continuation, attempt and skill parsing enforce fixed resource bounds.
-See [Security hardening](security-hardening.md) for exact limits and migration.
-
+HTTPTool and the `openai`/`anthropic` provider drivers confine redirects even
+with a custom client; `kit.Tool` rejects recursive input types; provider,
+continuation, and skill parsing enforce fixed resource bounds. See
+[Security hardening](security-hardening.md) for exact limits.
 ## Execution-completeness changes
 
 - Opt into provider JSON Schema output with `OutputPolicy.Native`; existing local
@@ -41,30 +38,28 @@ See [Security hardening](security-hardening.md) for exact limits and migration.
   fields should be changed to named fields. Mutable media is cloned at boundaries.
 - Use one fresh Control per execution. Queued input and persistent acknowledgement
   have different guarantees; see [Agent execution](agent-execution.md).
-- New continuations use v2; legacy v1 canonical bytes stay readable. Durable
-  content-only hashes require the separate security migration above. Follow the coordinated
-  reader/writer and rollback procedure in [Durable execution](durable-execution.md#wire-version-and-rollout).
+- New continuations use v2; legacy v1 canonical bytes stay readable. Follow the
+  continuation wire rollout procedure in [Agent execution](agent-execution.md#continuation-wire-version-and-rollout).
 - `Request.SessionBudget` can carry cumulative token and active wall-clock limits
-  through continuation and durable resume. `Request.ModelTimeouts` adds Codex-style
+  through continuation and resume. `Request.ModelTimeouts` adds Codex-style
   connection and stream-idle defaults; set `DisableDefaults` when an application
-  needs only explicit deadlines. `orchestration.DriveOptions` accepts whole-drive
-  and per-dispatch wall-clock limits.
+  needs only explicit deadlines.
 
 ## Package migration map
 
 | Removed surface | Current composition |
 | --- | --- |
-| root `venat.Runner` and `NewDevelopment` | import `agent`, `orchestration`, and optional `durable` directly |
+| root `venat.Runner` and `NewDevelopment` | import `agent`, `provider`, `tool`, `message`, and `skill` directly |
 | `api.Task` | `agent.Request` |
 | `api.TaskBudget` | `agent.Budget` |
 | `hook.Handler` / `hook.Chain` | `agent.Hook` / `agent.HookChain` |
 | `stream.Frame` / `stream.Sink` | `agent.Frame` / `agent.Sink` |
-| `multiagent` scheduling types | policy-free `orchestration.Scheduler`, `Dispatch`, `State`, `Executor`, and `Drive` |
-| `api.StoreProvider`, `api.UnitOfWork`, and table stores | execution-semantic `durable.Backend` when single-Agent durability is required |
-| `agent.Harness` and `session.Storage` | one `agent.Engine` loop with `agent.Continuation`; optionally wrap it in `durable.Runtime` |
+| `multiagent` and `orchestration` scheduling types | application-owned schedulers and worker pools |
+| `api.StoreProvider`, `api.UnitOfWork`, and `durable` | application-owned persistence using `agent.Continuation`, `agent.BoundaryObserver`, `provider.StreamInterceptor`, and `tool.Interceptor` |
+| `agent.Harness` and `session.Storage` | one `agent.Engine` loop with `agent.Continuation` and `Engine.Resume` |
 | turn checkpoint callbacks | `agent.BoundaryObserver` and `agent.Continuation` |
 | step routing that included handoff | `agent.StepDecider` for continue/finish/fail; put peer routing in an application scheduler |
-| built-in Agent-as-tool helpers | use `agent.NewAgentTool` for synchronous in-process delegation; use an application `tool.Driver`, `orchestration.Executor`, or coordinator for registries, workflows, process isolation, or independently durable children |
+| built-in Agent-as-tool helpers | use `agent.NewAgentTool` for synchronous in-process delegation; use an application `tool.Driver` for registries, workflows, process isolation, or persistent children |
 | MCP, cron, webhook, sandbox, bundle, and evaluation integrations | application or ecosystem adapters over current interfaces |
 
 Platform concepts such as application identity, approvals, quotas, resource claims, mailboxes, registries, pricing, tracing, triggers, deployment, and domain manifests no longer have core replacement symbols. Keep those models in the application that owns their policy and persistence.
@@ -103,81 +98,26 @@ Update behavior at the same time:
 - move approval and retry decisions outside `agent.Engine`
 - do not recreate deleted task or run records merely to call an Agent
 
-## Orchestration migration
+## Persistence and orchestration ownership
 
-Define application routing data as opaque strings or JSON and implement:
+Multi-agent scheduling (`orchestration`) and execution persistence state machines (`durable`) live in the consuming application or separate adapter modules, where they can integrate directly with the host's database transactions, tenancy, leases, and artifact stores.
 
-```go
-type Scheduler interface {
-    Next(context.Context, orchestration.State) ([]orchestration.Dispatch, error)
-}
-
-type Executor interface {
-    Execute(context.Context, orchestration.Dispatch, agent.Sink) (agent.Result, error)
-}
-```
-
-`orchestration.Drive` supplies bounded mechanical execution, not identity or strategy. Persist `orchestration.State` in application storage if scheduling must survive a restart. Use globally stable dispatch IDs; the SDK rejects reuse across ticks.
-
-## Durability migration
-
-Do not map every former table into `durable`. Implement only the twelve execution-semantic backend operations in `durable.Backend` and run `durable/contract.RunBackendContractTests`.
-
-The durable data model contains:
-
-- immutable execution spec and canonical hash
-- status, version, fenced lease, checkpoint, and terminal Agent result
-- model/tool attempts with input hash, independent version, opaque payload, and failure fact
-
-Typical flow:
-
-```go
-runtime, err := durable.New(backend, durable.Options{OwnerID: processID})
-if err != nil {
-    return err
-}
-result, err := runtime.Start(ctx, executionID, engine, request, outputPolicy)
-```
-
-On process recovery, construct a new runtime over a reopened backend handle and call `Resume`. A typed `durable.ReconcileRequiredError` means a provider or tool may have executed without a proven result. Investigate externally, call `Reconcile` with `succeed`, `fail`, or `retry`, then explicitly call `Resume` again.
-
-Controllers that previously resumed through application tokens should persist their own decision record, load the latest checkpoint, and call `ResumeWithOptions` with sequence, phase, and operation assertions. The SDK does not store approval policy or decision payloads in continuation state.
-
-Do not automatically retry an unknown effect. Only `provider.ErrNotStarted` and `tool.ErrNotExecuted` prove that no effect began.
-
-Version `1` is the first supported continuation wire format. Before enabling a v1 writer, drain pre-contract candidate executions, restart them under new execution IDs, or convert them offline with application knowledge; the SDK does not guess a v0 representation. Do not mix v1 writers with binaries that do not understand v1. After the first v1 checkpoint, rollback requires restoring application storage or a pre-write rollback point.
-
-## Backend cutover checklist
-
-- [ ] Choose an application execution ID namespace and revision strategy.
-- [ ] Implement trusted-time lease expiry and monotonic fencing tokens.
-- [ ] Implement exact claim and mutation replay.
-- [ ] Keep execution-version and attempt-version CAS independent.
-- [ ] Validate every save, load, and reopen checkpoint with `durable.ValidateCheckpoint`.
-- [ ] Convert stranded running attempts to unknown on release, expiry, suspend, and later claim.
-- [ ] Reject finish while an attempt is running or unknown.
-- [ ] Implement all three explicit reconciliation resolutions.
-- [ ] Return ownership-independent values.
-- [ ] Pass the complete backend conformance suite, including reopen and concurrency cases.
+Use `agent.BoundaryObserver`, `agent.EncodeContinuation` / `agent.DecodeContinuation`, `provider.StreamInterceptor` (`provider.ErrNotStarted`), and `tool.Interceptor` (`tool.ErrNotExecuted`) as the SDK seams for persistence and replay.
 
 ## Source cleanup checklist
 
-- [ ] Replace root-module imports with direct package imports.
+- [ ] Replace root-module imports with direct package imports (`agent`, `provider`, `tool`, `message`, `skill`).
 - [ ] Remove platform record conversion code and broad storage adapters.
 - [ ] Replace old hook and stream package imports with Agent equivalents.
-- [ ] Move routing, identity, approval, quota, and deployment policy into the application.
-- [ ] Replace former recipe or bundle dependencies with application modules.
-- [ ] Run `go mod tidy` to remove obsolete protocol and scheduler dependencies.
-- [ ] Run `go test ./...`, race tests, and backend conformance tests.
+- [ ] Move routing, identity, approval, quota, orchestration, and persistence state machines into the application.
+- [ ] Run `go mod tidy` to remove obsolete dependencies.
+- [ ] Run `go test ./...` and race tests.
 
 ## Semantic differences to preserve
 
 1. A non-nil `agent.Result.Failure` is terminal data, not an infrastructure error.
-2. `durable.Runtime` returns partial results on infrastructure errors; a result is terminal only when the Go error is nil.
-3. Streaming is transient and not an exactly-once event log.
-4. Durable execution covers provider and tool effects only. Hook, observer, guardrail, context-manager, and sink side effects need their own idempotency.
-5. Durable state covers one Agent execution. Application orchestration state remains separate.
-
+2. Streaming is transient and not an exactly-once event log.
+3. Only `provider.ErrNotStarted` and `tool.ErrNotExecuted` prove that an effect did not begin.
 ## Bounded response recovery and explicit Jev capability
 
 - Completed invalid tool JSON, empty final output and output-length cutoff now
@@ -194,6 +134,4 @@ Version `1` is the first supported continuation wire format. Before enabling a v
 - Jev is disabled by default. Explicit `BuildDeps.ContextSelection` plus a named
   `select_context` tool exposes advisory Noul scores, not automatic compaction.
   Set protocol, BaseURL, APIKey and Model; no environment/default endpoint is used.
-- Malformed full-call model attempts write envelope v2. Upgrade shared workers
-  before use; older readers reject this envelope. Ordinary attempts and existing
-  continuation canonical encodings are unchanged. See the durable rollout notes.
+- Existing continuation canonical encodings (v1 and v2) are unchanged.

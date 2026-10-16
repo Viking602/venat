@@ -19,14 +19,10 @@ Stable packages:
 - `provider`
 - `tool`
 - `skill`
-- `orchestration`
-- `durable` (including the backend conformance helpers in `durable/contract`)
 
 Implementation-detail packages:
 
-- `durable/internal/*`
 - `tool/tooltest`
-
 Archived v1 packages are not part of the current public import surface.
 
 ## Compatibility Rules
@@ -36,7 +32,7 @@ Archived v1 packages are not part of the current public import surface.
 - Event payloads may add fields.
 - Event type renames or removals require a major version.
 - Persisted continuation compatibility is versioned independently of Go source
-  compatibility. See [wire rollout rules](durable-execution.md#wire-version-and-rollout).
+  compatibility. See [Agent execution](agent-execution.md#continuation-wire-version-and-rollout).
 
 ## Release Gate
 

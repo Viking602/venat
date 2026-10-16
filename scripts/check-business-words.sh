@@ -6,7 +6,7 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
 BASELINE_FILE=".sentrux/business-words.baseline"
-required_scopes=(message provider tool skill agent orchestration durable)
+required_scopes=(message provider tool skill agent)
 
 if [[ ! -f "$BASELINE_FILE" ]]; then
   echo "FAIL: missing baseline file: $BASELINE_FILE" >&2

@@ -174,6 +174,9 @@ type LoopOutput struct {
 	RepairCount       int
 	ActiveElapsed     time.Duration
 	NextOperationTurn int
+	// contextUsage is the cumulative auxiliary context-model usage; structured
+	// output repair seeds the next segment with it so boundaries stay valid.
+	contextUsage provider.Usage
 }
 
 // Engine drives the bounded agent loop. Configure Provider, Tools, Hooks, and
@@ -274,6 +277,9 @@ func (e Engine) RunMessages(ctx context.Context, input LoopInput) (out LoopOutpu
 		out.NextOperationTurn = input.OperationTurn
 		out.ActiveElapsed = input.activeElapsed + time.Since(input.segmentStarted)
 		out.RepairCount = input.repairCount
+		if input.contextUsage != nil {
+			out.contextUsage = *input.contextUsage
+		}
 	}()
 	input, stepCapacity := normalizeIterationPolicy(input)
 	if input.ToolMode == "" {
@@ -340,6 +346,10 @@ func (e Engine) RunMessages(ctx context.Context, input LoopInput) (out LoopOutpu
 		// returned before reaching here and is never charged a budget failure.
 		next, preambleOutput, preambleStop, preErr := prepareIterationContext(turnCtx, input, current, totalUsage, steps, iteration, toolCallsUsed)
 		if preambleStop {
+			// Working-memory summaries fold their usage into totalUsage through
+			// the context observer even when compaction then fails; the preamble
+			// only saw the pre-compaction value.
+			preambleOutput.Usage = totalUsage
 			return preambleOutput, preErr
 		}
 		current = next
@@ -454,7 +464,7 @@ func recordInterruptedTurn(
 	}
 	current[len(current)-1].ContextArchived = true
 	turnsRun = max(turnsRun, iteration+1)
-	steps = append(steps, turnFailureStep(iteration, identity, usage, stopReason, StepDecisionContinue, totalUsage, toolCallsUsed))
+	steps = append(steps, turnFailureStep(iteration, identity, usage, stopReason, StepDecisionContinue, totalUsage, input.contextUsage, toolCallsUsed))
 	if err := observeFinalizedStep(ctx, input.StepObserver, steps); err != nil {
 		return current, totalUsage, steps, turnsRun, err
 	}
@@ -488,7 +498,7 @@ func handleTurnFailure(
 	current, totalUsage, turnsRun = recordIncompleteTurn(current, assistant, totalUsage, usage, iteration, turnsRun)
 	if opened {
 		turnsRun = max(turnsRun, iteration+1)
-		steps = append(steps, turnFailureStep(iteration, identity, usage, stopReason, StepDecisionFail, totalUsage, toolCallsUsed))
+		steps = append(steps, turnFailureStep(iteration, identity, usage, stopReason, StepDecisionFail, totalUsage, input.contextUsage, toolCallsUsed))
 		if observeErr := observeFinalizedStep(ctx, input.StepObserver, steps); observeErr != nil {
 			turnErr = errors.Join(turnErr, observeErr)
 		}
@@ -507,9 +517,10 @@ func turnFailureStep(
 	stopReason provider.StopReason,
 	decision StepDecision,
 	totalUsage provider.Usage,
+	contextUsage *provider.Usage,
 	toolCallsUsed int,
 ) Step {
-	return Step{
+	step := Step{
 		Index: iteration,
 		ModelCall: &ModelCall{
 			Provider:                      identity.Provider.Name,
@@ -527,6 +538,10 @@ func turnFailureStep(
 		Decision:   decision,
 		BudgetUsed: BudgetUsage{Tokens: int64(totalUsage.TotalTokens), ToolCalls: toolCallsUsed},
 	}
+	if contextUsage != nil {
+		step.ContextUsage = *contextUsage
+	}
+	return step
 }
 
 func recoverRunMessagesPanic(
@@ -547,12 +562,16 @@ func recoverRunMessagesPanic(
 	}
 	last := *lastModelCall
 	if last != nil && (len(*steps) == 0 || (*steps)[len(*steps)-1].ModelCall != last) {
-		*steps = append(*steps, Step{
+		step := Step{
 			Index:      *turnsRun - 1,
 			ModelCall:  last,
 			Decision:   StepDecisionFail,
 			BudgetUsed: BudgetUsage{Tokens: int64(totalUsage.TotalTokens), ToolCalls: *toolCallsUsed},
-		})
+		}
+		if input.contextUsage != nil {
+			step.ContextUsage = *input.contextUsage
+		}
+		*steps = append(*steps, step)
 		if observeErr := observeRecoveredStep(ctx, input.StepObserver, *steps); observeErr != nil {
 			*runErr = errors.Join(*runErr, observeErr)
 		}
@@ -709,6 +728,7 @@ func (e Engine) finalizeNoToolStep(
 		}
 		return current, steps, LoopOutput{}, true, nil
 	}
+	markTextToolCallResponse(&finalOutput, stopReason, e.Tools, input)
 	correction, recoveryErr := responseRecovery(steps, finalOutput, input.ResponseContinuation)
 	if recoveryErr != nil {
 		steps[len(steps)-1].Decision = StepDecisionFail

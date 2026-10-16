@@ -1,6 +1,6 @@
 # Contributing to Venat
 
-Venat is a small, typed Agent SDK. Changes must preserve the direct package graph, observable contracts, and optional nature of durability.
+Venat is a small, typed Agent SDK. Changes must preserve the direct package graph and observable contracts.
 
 ## Setup
 
@@ -35,10 +35,8 @@ Production capability families are exhaustive:
 - `tool`
 - `skill`
 - `agent`
-- `orchestration`
-- `durable`
 
-Examples, documentation, scripts, and the nested durable conformance package are supporting surfaces rather than new capability families. Applications are the composition root.
+Examples, documentation, and scripts are supporting surfaces rather than new capability families. Applications are the composition root.
 
 Read [docs/architecture-boundaries.md](docs/architecture-boundaries.md) before adding imports or directories. Do not bypass a boundary with aliases, bridge packages, generated code, or test-only reverse imports.
 
@@ -66,11 +64,7 @@ Relevant focused commands:
 
 ```bash
 go test ./agent ./message ./provider/... ./tool/... ./skill/...
-go test ./orchestration
-go test ./durable/...
 ```
-
-Every durable backend must run `durable/contract.RunBackendContractTests`, including its process-reopen path.
 
 ## Formatting and verification
 
@@ -90,8 +84,8 @@ Use Conventional Commits with a focused scope, for example:
 
 ```text
 feat(agent): add continuation boundary
-fix(durable): fence stale attempt settlement
-test(orchestration): cover deterministic concurrent fold
+fix(provider): bound stream idle timeout
+test(tool): cover parallel batch cancellation
 docs(migration): explain direct package cutover
 ```
 

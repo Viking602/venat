@@ -212,6 +212,7 @@ func applyToolCallEvent(call *message.ToolCall, builders map[string]*toolCallBui
 	if len(call.Arguments) > 0 {
 		builder.Arguments.Reset()
 		_, _ = builder.Arguments.Write(call.Arguments)
+		builder.fullArguments = true
 	}
 	builders[key] = builder
 	return nil
@@ -223,6 +224,12 @@ func applyToolCallDeltaEvent(delta *ToolCallDelta, builders map[string]*toolCall
 		return
 	}
 	key, builder := ensureToolCallBuilder(builders, order, idKeys, indexKeys, delta.ID, delta.Index, syntheticSeq)
+	if builder.fullArguments {
+		// A complete EventToolCall that carried arguments is authoritative,
+		// exactly as it replaces deltas that preceded it; trailing fragments
+		// must not corrupt it.
+		return
+	}
 	if delta.ID != "" {
 		builder.ID = delta.ID
 	}
@@ -287,6 +294,7 @@ type toolCallBuilder struct {
 	Name             string
 	Arguments        strings.Builder
 	fullSeen         bool
+	fullArguments    bool
 	identityConflict string
 }
 

@@ -1,14 +1,58 @@
 # Active plan
 
+## Core 5-package SDK consolidation (ADR-031)
+
+- Consolidated the production capability graph to `message`, `provider`, `tool`,
+  `skill`, and `agent`.
+- Removed `orchestration/` and `durable/` (and their dedicated examples) so
+  multi-agent scheduling and execution-persistence state machines remain owned
+  by consuming applications.
+- Retained `agent.Continuation` (v1/v2 canonical codec and validation),
+  `agent.BoundaryObserver`, `OperationID`, `provider.StreamInterceptor`,
+  `tool.Interceptor`, `agent.Control`, and `agent.NewAgentTool`.
+
+## Post-consolidation correctness and gate hardening
+
+Status: implemented and locally verified, 2026-10-16. Unreleased.
+
+- OpenAI Responses delivers the complete tool call at `output_item.done` when
+  safe streaming tools are enabled; previously it was dropped when no argument
+  deltas preceded it.
+- Provider drivers confine redirects of caller-supplied HTTP clients to the
+  original origin, matching the existing HTTPTool and default-client policy.
+- Structured-output repair and `Engine.Resume` carry cumulative context usage,
+  and failed/recovered steps snapshot context usage before `StepObserver` runs,
+  so repaired and resumed runs with working memory and boundary observers
+  produce valid continuations.
+- Usage from a working-memory summary is reported when compaction then fails.
+- When tools are registered and a completed turn emits a plain-text tool call
+  (protocol tags such as `<tool_call>`/`<function=...>` or a JSON tool-call
+  envelope naming a registered tool) instead of structured `ToolCalls`,
+  response recovery instructs the model to invoke the structured tool API
+  rather than terminating the loop early.
+- `ValidateCompleteTurns` no longer lets a duplicate result for a known call ID
+  stand in for an empty-ID call. OpenAI Chat emits the resolved index for
+  index-less deltas; OpenAI Responses binds delayed `call_id`/`name` at
+  `output_item.done`; Anthropic keeps one provider-state block when a stop event
+  precedes its start and ignores unstarted stop events; complete tool calls with
+  arguments ignore trailing deltas; scripted replays deep-clone mutable event
+  fields; rejected oversized tool names truncate on a UTF-8 boundary.
+- The public-any gate now detects `interface{}` spellings and accepts only a
+  standalone tag comment; import/package gates fail on `go list` errors;
+  `tidy-check` restores `go.mod`/`go.sum` when tidy fails; dead lint excludes
+  were removed. The pinned toolchain moves to Go 1.26.9, which clears ten
+  reachable standard-library vulnerabilities; the module still declares Go 1.25.
+- Intended behavior kept: an empty-ID tool call may still match an unknown
+  result ID, a streamed tool output still supplies legacy text-only results,
+  and small `OutputStore` preview thresholds still store bodies.
+
 ## Nonterminal pauses and live direction changes
 
 - Explicit provider pauses retain assistant state and continue automatically;
   repeated non-progress and exhausted loop allowance report typed failures.
 - Control separates safe-boundary input, active steering, and deferred follow-up.
-- Worker handles and model tools expose steering without discarding history.
 - Already started writes retain real results; obsolete pending calls are skipped.
 - Local examples: `examples/pause-continuation` and `examples/live-steering`.
-
 
 ## Practical agent runtime
 
@@ -18,22 +62,10 @@ Implemented capabilities:
 - Model-backed working memory, recent complete tool groups, summary usage, and
   recognized context-overflow recovery.
 - Ordered parallel tool groups and concurrent child token reservations.
-- In-memory asynchronous workers with task tools, completion delivery,
-  retained follow-up context, and independent cancellation.
 - Executable acceptance checks through existing output guardrails.
 - Explicitly opted-in complete-call streaming for safe read tools.
 
-The six credential-free examples exercise execution mechanics, including real
-file/process verification and channel-controlled overlap. They do not establish
-real-model task quality, summary accuracy, or provider cache-hit improvements.
-Optional durability remains available but is not a prerequisite for these
-runtime capabilities. Current setup and ownership contracts are documented in
-`docs/agent-execution.md`.
-
-Verification: `make ci-local` passed, including lint, the full test suite,
-race tests, and all architecture gates. The six new examples and the existing
-interactive example passed as executable runtime smoke scenarios.
-
+Current setup and ownership contracts are documented in `docs/agent-execution.md`.
 
 ## Codex-style execution envelopes
 
@@ -43,8 +75,7 @@ Status: implemented, 2026-09-20.
   token and active wall-clock limits.
 - [x] Enforce Codex-compatible model connection and stream-idle defaults, with
   optional whole-request timeout and typed timeout causes.
-- [x] Add whole-drive wall-clock and per-dispatch deadlines while preserving
-  deterministic concurrency, tick, partial-result, and cancellation behavior.
+- [x] Preserve deterministic concurrency, partial-result, and cancellation behavior.
 
 The defaults are intentionally local SDK policy. Account quotas, provider rate
 limits, application session identity, and durable backend retention remain
@@ -224,49 +255,5 @@ bounded input, cancellation, and checkpoint semantics.
   exchanges without deleting recovery evidence. It uses a conservative byte
   estimate; media needs a model-aware compactor. Custom managers keep their
   existing compaction behavior.
-- New continuations use v2. The immutable v1 fixture retains its canonical bytes
-  and existing hash semantics. Coordinated worker rollout and rollback are
-  documented in [Durable execution](../durable-execution.md#wire-version-and-rollout).
-- Implementation is local and unreleased. Recovery proof uses the private test
-  backend; no production backend or authenticated live-model evaluation is
-  claimed. Usage and guarantees are in [Agent execution](../agent-execution.md).
-
-### Application-stage work (outside this delivery)
-
-- CubeSandbox/MCP adapters and interactive process ownership in the consuming app.
-- A production durable backend, including the backend contract and process-reopen
-  suite against the selected real storage system.
-- Asynchronous agent registry, mailbox routing, workspace coordination, and
-  application-level restart/reconciliation acceptance.
-- Model-backed summarization and tool retrieval when actual task/context metrics
-  justify them; the SDK delivery supplies deterministic context reduction first.
-
-### Baseline
-
-- Clean checkout at `3e937a5b0cd24ce90570407d853c756eb38c88f3`.
-- `make ci-local` passed before changes on 2026-09-20.
-
-## Agent SDK, optional durability, and streaming cutover
-
-Status: implementation complete; focused tests, executable smoke scenarios, architecture proof, `make verify`, and `make ci-local` passed on 2026-08-29.
-
-Sources of truth: [ADR-029](../adr/ADR-029-agent-sdk-and-optional-durable-runtime.md) for package placement, [ADR-030](../adr/ADR-030-stream-lifecycle-semantics.md) for streaming lifecycle/replay semantics, and the approved refactor plan for the implementation sequence.
-
-### Deliverables
-
-- [x] Application-neutral `agent.Request`, hooks, output frames, strict v1 continuation codec, resume, and effect interception.
-- [x] Policy-free `orchestration` scheduler, application catalog/event examples, and bounded deterministic drive loop.
-- [x] Execution-semantic `durable.Backend`, diagnostic conformance suite, private test backend, `durable.Runtime`, targeted resume, and application-owned approval example.
-- [x] Direct-import package graph, executable examples, current documentation, migration guidance, and fail-closed absence/boundary gates.
-- [x] Bounded real-time tool updates across tool, Agent frames, and transient durable semantics.
-- [x] ADR-030 stream lifecycle documentation and P2 focused verification.
-- [x] Final example smoke, package-graph proof, `make verify`, and `make ci-local`.
-
-### Acceptance
-
-- The production package graph contains only the approved capability families.
-- Agent and orchestration package dependencies do not include durability.
-- An application can execute one Agent without adopting persistence or orchestration.
-- An injected backend can recover checkpoints, replay settled effects, and block unknown effects until explicit reconciliation.
-- All examples execute as normal packages included by `go test ./...`.
-- Current documentation recommends only direct imports and application-owned composition.
+- New continuations use v2. The immutable v1 fixture retains its canonical bytes.
+  Usage and guarantees are in [Agent execution](../agent-execution.md).

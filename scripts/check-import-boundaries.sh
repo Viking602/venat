@@ -6,7 +6,7 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
 module="$(go list -m -f '{{.Path}}')"
-required_scopes=(message provider tool skill agent orchestration durable)
+required_scopes=(message provider tool skill agent)
 violations=0
 
 is_within() {
@@ -26,8 +26,6 @@ allowed_for_scope() {
     tool) allowed=(tool message) ;;
     skill) allowed=(skill) ;;
     agent) allowed=(agent message provider tool skill) ;;
-    orchestration) allowed=(orchestration agent message provider tool) ;;
-    durable) allowed=(durable agent message provider tool) ;;
     *) return 1 ;;
   esac
 
@@ -53,6 +51,9 @@ for scope in "${required_scopes[@]}"; do
     continue
   fi
 
+  # Capture first: a process substitution would discard go list's exit status
+  # and let an unloadable package tree pass with a partial scan.
+  imports="$(go list -f '{{$p := .ImportPath}}{{range .Imports}}{{printf "prod\t%s\t%s\n" $p .}}{{end}}{{range .TestImports}}{{printf "test\t%s\t%s\n" $p .}}{{end}}{{range .XTestImports}}{{printf "xtest\t%s\t%s\n" $p .}}{{end}}' "./$scope/...")"
   while IFS=$'\t' read -r kind package imported; do
     [[ -z "${package:-}" || -z "${imported:-}" ]] && continue
     if ! is_within "$imported" "$module"; then
@@ -63,9 +64,7 @@ for scope in "${required_scopes[@]}"; do
     fi
     printf 'FAIL [%s-imports]: %s imports %s (%s)\n' "$scope" "$package" "$imported" "$kind" >&2
     violations=$((violations + 1))
-  done < <(
-    go list -f '{{$p := .ImportPath}}{{range .Imports}}{{printf "prod\t%s\t%s\n" $p .}}{{end}}{{range .TestImports}}{{printf "test\t%s\t%s\n" $p .}}{{end}}{{range .XTestImports}}{{printf "xtest\t%s\t%s\n" $p .}}{{end}}' "./$scope/..."
-  )
+  done <<<"$imports"
 done
 
 if ((violations > 0)); then

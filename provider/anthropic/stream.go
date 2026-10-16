@@ -571,9 +571,11 @@ func (s *anthropicStream) recordContentBlockStart(parsed eventEnvelope) {
 	})
 	switch parsed.ContentBlock.Type {
 	case "tool_use":
+		indexCopy := parsed.Index
 		s.state.toolCalls[parsed.Index] = provider.ToolCallDelta{
-			ID:   parsed.ContentBlock.ID,
-			Name: parsed.ContentBlock.Name,
+			Index: &indexCopy,
+			ID:    parsed.ContentBlock.ID,
+			Name:  parsed.ContentBlock.Name,
 		}
 		current := s.state.toolCalls[parsed.Index]
 		s.state.pending = append(s.state.pending, provider.Event{
@@ -615,7 +617,9 @@ func (s *anthropicStream) recordContentBlockDelta(parsed eventEnvelope) {
 			block.Input = nil
 		}
 		block.Input = append(block.Input, parsed.Delta.PartialJSON...)
+		indexCopy := parsed.Index
 		current := s.state.toolCalls[parsed.Index]
+		current.Index = &indexCopy
 		current.ArgumentsDelta = parsed.Delta.PartialJSON
 		s.state.toolCalls[parsed.Index] = current
 		s.state.pending = append(s.state.pending, provider.Event{
@@ -635,8 +639,8 @@ func (s *anthropicStream) emitCompleteToolCall(index int) {
 		return
 	}
 	current := s.state.toolCalls[index]
-	block := s.block(index)
-	if current.ID == "" || current.Name == "" || !json.Valid(block.Input) {
+	block, ok := s.state.blocks[index]
+	if !ok || current.ID == "" || current.Name == "" || !json.Valid(block.Input) {
 		return
 	}
 	call := message.ToolCall{
@@ -671,7 +675,7 @@ func (s *anthropicStream) startBlock(index int, block contentBlock) {
 		if block.Data == "" {
 			block.Data = existing.Data
 		}
-		if len(block.Input) == 0 {
+		if len(block.Input) == 0 || (bytes.Equal(bytes.TrimSpace(block.Input), []byte("{}")) && len(existing.Input) > 0) {
 			block.Input = existing.Input
 		}
 		if len(block.Citations) == 0 {
@@ -683,10 +687,14 @@ func (s *anthropicStream) startBlock(index int, block contentBlock) {
 	s.state.blocks[index] = block
 }
 
+// block returns the block at index, registering its stream position on first
+// sight so a later content_block_start for the same index merges instead of
+// appending a duplicate entry to blockOrder.
 func (s *anthropicStream) block(index int) contentBlock {
 	block, ok := s.state.blocks[index]
 	if !ok {
 		s.state.blockOrder = append(s.state.blockOrder, index)
+		s.state.blocks[index] = block
 	}
 	return block
 }

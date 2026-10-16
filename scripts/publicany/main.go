@@ -19,8 +19,6 @@ var requiredScopes = []string{
 	"tool",
 	"skill",
 	"agent",
-	"orchestration",
-	"durable",
 }
 
 type violation struct {
@@ -132,6 +130,7 @@ func scanExportedFunctions(path string, fileSet *token.FileSet, file *ast.File, 
 
 func scanExportedStructs(path string, fileSet *token.FileSet, file *ast.File, lines [][]byte) []violation {
 	var violations []violation
+	typeDecls := collectFileTypeDecls(file)
 	for _, declaration := range file.Decls {
 		general, ok := declaration.(*ast.GenDecl)
 		if !ok || general.Tok != token.TYPE {
@@ -146,16 +145,32 @@ func scanExportedStructs(path string, fileSet *token.FileSet, file *ast.File, li
 			if !ok {
 				continue
 			}
-			violations = append(violations, scanExportedFields(path, fileSet, structure, lines)...)
+			violations = append(violations, scanExportedFields(path, fileSet, structure, lines, typeDecls)...)
 		}
 	}
 	return violations
 }
 
-func scanExportedFields(path string, fileSet *token.FileSet, structure *ast.StructType, lines [][]byte) []violation {
+func collectFileTypeDecls(file *ast.File) map[string]ast.Expr {
+	decls := make(map[string]ast.Expr)
+	for _, declaration := range file.Decls {
+		general, ok := declaration.(*ast.GenDecl)
+		if !ok || general.Tok != token.TYPE {
+			continue
+		}
+		for _, specification := range general.Specs {
+			if typeSpec, ok := specification.(*ast.TypeSpec); ok && typeSpec.Name != nil {
+				decls[typeSpec.Name.Name] = typeSpec.Type
+			}
+		}
+	}
+	return decls
+}
+
+func scanExportedFields(path string, fileSet *token.FileSet, structure *ast.StructType, lines [][]byte, typeDecls map[string]ast.Expr) []violation {
 	var violations []violation
 	for _, field := range structure.Fields.List {
-		if !containsAny(field.Type) || !hasExportedFieldName(field) {
+		if !hasExportedOrEmbeddedField(field) || !containsAnyWithTypes(field.Type, typeDecls, map[string]bool{}) {
 			continue
 		}
 		line := fileSet.Position(field.Pos()).Line
@@ -167,7 +182,10 @@ func scanExportedFields(path string, fileSet *token.FileSet, structure *ast.Stru
 	return violations
 }
 
-func hasExportedFieldName(field *ast.Field) bool {
+func hasExportedOrEmbeddedField(field *ast.Field) bool {
+	if len(field.Names) == 0 {
+		return true
+	}
 	for _, name := range field.Names {
 		if name.IsExported() {
 			return true
@@ -184,8 +202,7 @@ func fieldListContainsSliceAny(fields *ast.FieldList) bool {
 			if !ok || array.Len != nil {
 				return true
 			}
-			identifier, ok := array.Elt.(*ast.Ident)
-			if ok && identifier.Name == "any" {
+			if isLooseAny(array.Elt) {
 				found = true
 				return false
 			}
@@ -198,11 +215,32 @@ func fieldListContainsSliceAny(fields *ast.FieldList) bool {
 	return false
 }
 
-func containsAny(expression ast.Expr) bool {
+func containsAnyWithTypes(expression ast.Expr, typeDecls map[string]ast.Expr, visited map[string]bool) bool {
 	found := false
 	ast.Inspect(expression, func(node ast.Node) bool {
-		identifier, ok := node.(*ast.Ident)
-		if ok && identifier.Name == "any" {
+		if expr, ok := node.(ast.Expr); ok && isLooseAny(expr) {
+			found = true
+			return false
+		}
+		ident, ok := node.(*ast.Ident)
+		if !ok || visited[ident.Name] {
+			return true
+		}
+		decl, exists := typeDecls[ident.Name]
+		if !exists {
+			return true
+		}
+		visited[ident.Name] = true
+		if structType, ok := decl.(*ast.StructType); ok {
+			for _, field := range structType.Fields.List {
+				if hasExportedOrEmbeddedField(field) && containsAnyWithTypes(field.Type, typeDecls, visited) {
+					found = true
+					return false
+				}
+			}
+			return true
+		}
+		if containsAnyWithTypes(decl, typeDecls, visited) {
 			found = true
 			return false
 		}
@@ -211,7 +249,25 @@ func containsAny(expression ast.Expr) bool {
 	return found
 }
 
+// isLooseAny reports the predeclared any and its spelling interface{}.
+func isLooseAny(expression ast.Expr) bool {
+	switch typed := expression.(type) {
+	case *ast.Ident:
+		return typed.Name == "any"
+	case *ast.InterfaceType:
+		return typed.Methods == nil || len(typed.Methods.List) == 0
+	}
+	return false
+}
+
+// hasImmediateTag accepts only a standalone comment line directly above the
+// declaration that starts with the tag (optionally followed by ": reason"), so
+// a trailing comment on a neighboring field cannot exempt the next one.
 func hasImmediateTag(lines [][]byte, declarationLine int, tag string) bool {
 	previous := declarationLine - 2
-	return previous >= 0 && previous < len(lines) && strings.Contains(string(lines[previous]), tag)
+	if previous < 0 || previous >= len(lines) {
+		return false
+	}
+	comment := strings.TrimSpace(string(lines[previous]))
+	return comment == tag || strings.HasPrefix(comment, tag+":")
 }

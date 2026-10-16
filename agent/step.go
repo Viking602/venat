@@ -16,8 +16,10 @@ type Step struct {
 	ToolCalls    []ToolCallTrace `json:"toolCalls,omitempty"`
 	Observations []Observation   `json:"observations,omitempty"`
 	Decision     StepDecision    `json:"decision,omitempty"`
-	// ContextUsage is a cumulative snapshot, not a per-turn delta. It keeps
-	// summary calls attributable even when they occur between model steps.
+	// ContextUsage is a cumulative snapshot, not a per-turn delta. Context work
+	// between two model turns advances the latest step's ContextUsage and
+	// BudgetUsed.Tokens, so a ready boundary's Usage always equals the latest
+	// BudgetUsed.Tokens.
 	ContextUsage provider.Usage `json:"contextUsage,omitzero"`
 	BudgetUsed   BudgetUsage    `json:"budgetUsed,omitempty"`
 }

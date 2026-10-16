@@ -152,6 +152,8 @@ type streamState struct {
 	contextUsage         provider.ContextUsageObserver
 	contextUsageReported bool
 	toolCalls            map[int]*message.ToolCall
+	toolCallIDIndex      map[string]int
+	lastToolCallSlot     *int
 	toolCallOrder        []int
 	emittedToolCalls     map[int]bool
 	completeToolCalls    bool
@@ -480,8 +482,20 @@ func (s *openAIStream) Recv() (provider.Event, error) {
 func (s *openAIStream) validateChunk(parsed chunk) error {
 	toolItems := 0
 	indexes := make(map[int]int, len(s.state.toolCalls))
+	simCalls := make(map[int]*message.ToolCall, len(s.state.toolCalls))
 	for index, call := range s.state.toolCalls {
 		indexes[index] = len(call.Arguments)
+		copied := *call
+		simCalls[index] = &copied
+	}
+	simIDIndex := maps.Clone(s.state.toolCallIDIndex)
+	if simIDIndex == nil {
+		simIDIndex = make(map[string]int)
+	}
+	var simLastSlot *int
+	if s.state.lastToolCallSlot != nil {
+		slot := *s.state.lastToolCallSlot
+		simLastSlot = &slot
 	}
 	for _, choice := range parsed.Choices {
 		for _, item := range choice.Delta.ToolCalls {
@@ -492,12 +506,18 @@ func (s *openAIStream) validateChunk(parsed chunk) error {
 			if len(item.Function.Name) > message.MaxToolNameBytes {
 				return fmt.Errorf("openai tool name exceeds %d bytes", message.MaxToolNameBytes)
 			}
-			index := 0
-			if item.Index != nil {
-				index = *item.Index
-			}
+			index := resolveToolCallIndex(item, simCalls, simIDIndex, &simLastSlot)
 			if index < 0 {
 				return fmt.Errorf("openai tool index is negative")
+			}
+			if simCalls[index] == nil {
+				simCalls[index] = &message.ToolCall{}
+			}
+			if item.ID != "" {
+				simCalls[index].ID = item.ID
+			}
+			if item.Function.Name != "" {
+				simCalls[index].Name = item.Function.Name
 			}
 			if len(item.Function.Arguments) > (1<<20)-indexes[index] {
 				return fmt.Errorf("openai tool arguments exceed byte limit")
@@ -600,11 +620,11 @@ func (s *openAIStream) processChoiceDelta(choice choiceChunk) {
 			})
 		}
 	}
+	if s.state.toolCallIDIndex == nil {
+		s.state.toolCallIDIndex = make(map[string]int)
+	}
 	for _, item := range choice.Delta.ToolCalls {
-		index := 0
-		if item.Index != nil {
-			index = *item.Index
-		}
+		index := resolveToolCallIndex(item, s.state.toolCalls, s.state.toolCallIDIndex, &s.state.lastToolCallSlot)
 		call := s.state.toolCalls[index]
 		if call == nil {
 			call = &message.ToolCall{}
@@ -618,10 +638,13 @@ func (s *openAIStream) processChoiceDelta(choice choiceChunk) {
 			call.Name = item.Function.Name
 		}
 		call.Arguments = append(call.Arguments, item.Function.Arguments...)
+		// Emit the index the adapter actually merged under; an omitted index
+		// would make normalization split one call into ID-less fragments.
+		resolvedIndex := index
 		s.state.pending = append(s.state.pending, provider.Event{
 			Kind: provider.EventToolCallDelta,
 			ToolCallDelta: &provider.ToolCallDelta{
-				Index:          item.Index,
+				Index:          &resolvedIndex,
 				ID:             item.ID,
 				Name:           item.Function.Name,
 				ArgumentsDelta: item.Function.Arguments,
@@ -634,6 +657,57 @@ func (s *openAIStream) processChoiceDelta(choice choiceChunk) {
 			s.emitCompleteToolCalls()
 		}
 	}
+}
+
+func resolveToolCallIndex(item toolCallDeltaItem, calls map[int]*message.ToolCall, idIndex map[string]int, lastSlot **int) int {
+	if item.Index != nil {
+		index := *item.Index
+		if item.ID != "" && idIndex != nil {
+			idIndex[item.ID] = index
+		}
+		*lastSlot = &index
+		return index
+	}
+	if item.ID != "" {
+		if index, ok := idIndex[item.ID]; ok {
+			*lastSlot = &index
+			return index
+		}
+		if *lastSlot != nil {
+			if existing := calls[**lastSlot]; existing != nil && existing.ID == "" && (existing.Name == "" || item.Function.Name == "") {
+				index := **lastSlot
+				if idIndex != nil {
+					idIndex[item.ID] = index
+				}
+				return index
+			}
+		}
+		index := 0
+		for calls[index] != nil {
+			index++
+		}
+		if idIndex != nil {
+			idIndex[item.ID] = index
+		}
+		*lastSlot = &index
+		return index
+	}
+	if *lastSlot != nil {
+		if item.Function.Name != "" {
+			if existing := calls[**lastSlot]; existing != nil && existing.Name != "" {
+				index := 0
+				for calls[index] != nil {
+					index++
+				}
+				*lastSlot = &index
+				return index
+			}
+		}
+		return **lastSlot
+	}
+	index := 0
+	*lastSlot = &index
+	return 0
 }
 
 func (s *openAIStream) emitCompleteToolCalls() {

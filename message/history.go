@@ -139,7 +139,12 @@ func CachePrefixBoundary(messages []Message) (int, error) {
 
 func unmatchedCallIndex(calls []ToolCall, matched []bool, callIndexes map[string]int, resultID string) int {
 	if resultID != "" {
-		if index, exists := callIndexes[resultID]; exists && !matched[index] {
+		if index, exists := callIndexes[resultID]; exists {
+			// A result naming a known call belongs to that call alone; a second
+			// result for it is a duplicate, never a stand-in for an empty ID.
+			if matched[index] {
+				return -1
+			}
 			return index
 		}
 		for index, call := range calls {
